@@ -1,4 +1,7 @@
-# TotK Recomp
+# TotK Recomp FrameGen
+
+A fork of [TotK Recomp](https://github.com/valentderah/totk-pc-recomp) with NVIDIA DLSS Frame Generation and the
+frame-rate work described below.
 
 **TotK Recomp** is a static recompilation of *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, 2023) into a native x86-64 application for Windows and Linux ([docs/architecture.md](docs/architecture.md)).
 
@@ -9,7 +12,7 @@
 
 ## This fork: frame-rate work
 
-This fork (luojuluochen/totk-pc-recomp, main) is a derivative of upstream TotK Recomp whose changes aim at the frame
+This fork (luojuluochen/totk-recomp-framegen, main) is a derivative of upstream TotK Recomp whose changes aim at the frame
 rate on high-refresh displays: NVIDIA DLSS Frame Generation on top of the current main branch, the stability fixes the
 unmerged draft needed to run for hours, and a frame limit that the frame generator cannot overrun. The frame generation
 integration comes from the draft in upstream issue #1069 (al4xdev, MIT); the fixes and the overlay change are ours.
