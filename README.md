@@ -97,28 +97,16 @@ menu_lang = zh-Hans
 
 ### Known issue: whole-picture flicker with frame generation
 
-1. **Symptom.** The whole picture flickers, the HUD included, and the game's own image flickers with it. The amplitude
-   grows with dlss_fg_x: 2x is mild, 4x and 6x are clearly visible.
-2. **Where it appears.** Only in some high-contrast areas, around Lookout Landing and the fort for example; most of the
-   map is unaffected. It is easiest to see standing still with the camera still, and moving masks it.
-3. **Reproduction.** Walk to Lookout Landing, stand still, and watch the picture with dlss_fg = 1. Toggle frame
-   generation off in the menu (F1) at the same spot: the flicker stops.
-4. **What it is not.** It is not the draft author's "frame pacing" problem. Pacing is about when the generated pictures
-   are shown (uneven spacing, judder); this is about what they contain (the generated picture differs from the real
-   one).
-5. **What we narrowed down.** Frame generation interpolates between two real frames. In those areas, per-frame exposure
-   and tonemapping changes and semi-transparent effects (fog, particles, banners) make consecutive frames differ
-   globally, and the current path interpolates the HUD as if it were scene (the final picture is given to NGX as
-   DLSSG.HUDLess). The interpolated picture therefore differs from the real one and alternates with it at the display
-   rate. A smaller contributor: DLSS itself misses its processing point on some frames in that area, so frames alternate
-   between DLSS-resolved and raw output.
-6. **What was tried, none of it removed the flicker without a large frame-rate loss:** a HUD-less capture with a UI
-   composite shader (kept on an unmerged branch; the capture then missed most frames under chunked replay and the
-   composite made the scene judder), NGX menu detection off, fixed exposure, the sky stamp, per-object motion vectors,
-   jitter off, disabled dynamic resolution, and 2x to 6x multipliers.
-7. **Status.** Unresolved. Workarounds: use 2x, which halves the number of generated pictures, or turn frame generation
-   off in the affected area in the menu (F1). Turning the scene upscaler off also stops it, but that also disables
-   DLSS-G, which needs the upscaler.
+1. **Symptom.** With dlss_fg on, the whole picture flickers (the HUD and the game's own image together) in some areas.
+   The amplitude grows with dlss_fg_x: 2x is mild, 4x and 6x are clearly visible.
+2. **Where and how to reproduce.** At Lookout Landing, in view of the fort (the large fort north-west of the landing):
+   stand still with the camera still and watch the picture; it flickers within a second or two. The same view with
+   frame generation off (menu, F1) is steady. High-contrast spots elsewhere in the world show it too; most of the map
+   does not. (The exact map coordinates depend on the save; the view is what matters: fort, sky and cliff in the frame
+   at once.)
+3. **Workarounds.** Keep the camera moving (the motion masks the flicker), turn frame generation off in the menu (F1)
+   while playing in such an area, or use dlss_fg_x = 2, which makes it much less noticeable. Turning the scene upscaler
+   off also stops it, but that also disables DLSS-G, which needs the upscaler.
 
 ### 中文说明
 
