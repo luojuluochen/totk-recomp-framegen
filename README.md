@@ -79,14 +79,14 @@ dynamic_res = 0
 aniso = 16
 grass_range = 200
 scene_upscaler = dlss
-dlss = dlaa                ; quality when the higher frame rate matters more
+dlss = quality             ; 2560x1440 -> 4K
 dlss_fg = 1
-dlss_fg_x = 4
-shadow_res = 2048
-shadow_scale = 2
-shadow_range = 100
-contact_shadows = 70
-pcss = 70
+dlss_fg_x = 3
+shadow_res = 1024
+shadow_scale = 3
+shadow_range = 200
+contact_shadows = 40
+pcss = 40
 perf_overlay = full
 
 [diagnostics]
