@@ -34,7 +34,8 @@ integration comes from the draft in upstream issue #1069 (al4xdev, MIT); the fix
 5. **The full performance overlay shows the frame-rate line too.** The first F10 press shows the drawn rate and, with
    frame generation, the pictures shown a second; the second press (the full panel) now shows the same line, so the
    drawn rate is not lost when the panel is open.
-6. **Settings measured on an RTX 5070 Ti and a Ryzen 7 9700X with a 240 Hz 4K display**, with this fork:
+6. **Recommended combination on an RTX 5070 Ti, a Ryzen 7 9700X and a 240 Hz 4K display** (the full settings used on
+   the test machine are below):
 
    ```ini
    [display]
@@ -55,22 +56,69 @@ integration comes from the draft in upstream issue #1069 (al4xdev, MIT); the fix
    frame_queue = 1 measured lower frame rates here; dlaa_objmv = 0 and lower shadow settings are the remaining
    CPU/GPU levers (see "Known issue" below for what they cost in picture quality).
 
+### Complete settings used on the test machine
+
+The settings the numbers below were measured with, as they were played (RTX 5070 Ti, Ryzen 7 9700X, 3840x2160 at
+240 Hz). trace and perf_slow_ms are diagnostics and can be left out for normal play.
+
+```ini
+[frame rate]
+fps_limit = display        ; 240 shown, 80 drawn with 3x, 60 with 4x
+replay_workers = 4
+sync_ahead = 1
+
+[display]
+window_size = 3840x2160
+fullscreen = 1
+output_res = 3840x2160
+render_scale = 100
+dynamic_res = 0
+aniso = 16
+grass_range = 200
+scene_upscaler = dlss
+dlss = dlaa                ; quality when the higher frame rate matters more
+dlss_fg = 1
+dlss_fg_x = 4
+shadow_res = 2048
+shadow_scale = 2
+shadow_range = 100
+contact_shadows = 70
+pcss = 70
+perf_overlay = full
+
+[diagnostics]
+trace = perf
+perf_slow_ms = 25
+
+[language]
+lang = zh-Hans
+menu_lang = zh-Hans
+```
+
 ### Known issue: whole-picture flicker with frame generation
 
-With dlss_fg = 1, in some high-contrast areas (around Lookout Landing and the fort, for example) the whole picture,
-the HUD included, flickers; the amplitude grows with dlss_fg_x. It is easiest to see standing still, and moving
-masks it. Turning frame generation off removes it; turning the scene upscaler off removes it as well.
-
-What we could narrow down: frame generation interpolates between two real frames. In those areas per-frame exposure and
-tonemapping changes and semi-transparent effects (fog, particles, banners) make consecutive frames differ globally, and
-the current path interpolates the HUD as if it were scene (the final picture is given to NGX as DLSSG.HUDLess). The
-interpolated picture therefore differs from the real one and alternates with it at the display rate.
-
-Tried, none removed the flicker without a large frame-rate loss: a HUD-less capture with a UI composite shader (kept on
-an unmerged branch), NGX menu detection off, fixed exposure, the sky stamp, per-object motion vectors, jitter off, and 2x
-to 6x multipliers. The draft's own "frame pacing" issue is a different problem: it is about when the generated pictures
-are shown, not about what they contain. Use 2x to make the flicker less noticeable, or turn frame generation off in
-those areas.
+1. **Symptom.** The whole picture flickers, the HUD included, and the game's own image flickers with it. The amplitude
+   grows with dlss_fg_x: 2x is mild, 4x and 6x are clearly visible.
+2. **Where it appears.** Only in some high-contrast areas, around Lookout Landing and the fort for example; most of the
+   map is unaffected. It is easiest to see standing still with the camera still, and moving masks it.
+3. **Reproduction.** Walk to Lookout Landing, stand still, and watch the picture with dlss_fg = 1. Toggle frame
+   generation off in the menu (F1) at the same spot: the flicker stops.
+4. **What it is not.** It is not the draft author's "frame pacing" problem. Pacing is about when the generated pictures
+   are shown (uneven spacing, judder); this is about what they contain (the generated picture differs from the real
+   one).
+5. **What we narrowed down.** Frame generation interpolates between two real frames. In those areas, per-frame exposure
+   and tonemapping changes and semi-transparent effects (fog, particles, banners) make consecutive frames differ
+   globally, and the current path interpolates the HUD as if it were scene (the final picture is given to NGX as
+   DLSSG.HUDLess). The interpolated picture therefore differs from the real one and alternates with it at the display
+   rate. A smaller contributor: DLSS itself misses its processing point on some frames in that area, so frames alternate
+   between DLSS-resolved and raw output.
+6. **What was tried, none of it removed the flicker without a large frame-rate loss:** a HUD-less capture with a UI
+   composite shader (kept on an unmerged branch; the capture then missed most frames under chunked replay and the
+   composite made the scene judder), NGX menu detection off, fixed exposure, the sky stamp, per-object motion vectors,
+   jitter off, disabled dynamic resolution, and 2x to 6x multipliers.
+7. **Status.** Unresolved. Workarounds: use 2x, which halves the number of generated pictures, or turn frame generation
+   off in the affected area in the menu (F1). Turning the scene upscaler off also stops it, but that also disables
+   DLSS-G, which needs the upscaler.
 
 ### 中文说明
 
