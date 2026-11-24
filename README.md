@@ -130,6 +130,9 @@ Adjust these to the hardware; they are in the menu (F1, the Screen tab) or in to
    while playing in such an area, or use dlss_fg_x = 2, which makes it much less noticeable. Turning the scene upscaler
    off also stops it, but that also disables DLSS-G, which needs the upscaler.
 
+A video of the effect (Simplified Chinese, Bilibili): https://www.bilibili.com/video/BV1yh1AzmEbU/ — the flicker is
+shown at 02:36.
+
 ### 中文说明
 
 这个 fork 基于上游 TotK Recomp，主要解决高刷新率下的帧率问题：把未合并的 DLSS 帧生成草案移植到最新 main，并修复了它
