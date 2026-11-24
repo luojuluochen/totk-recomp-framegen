@@ -98,6 +98,24 @@ lang = zh-Hans
 menu_lang = zh-Hans
 ```
 
+### Settings that move the frame rate most
+
+Adjust these to the hardware; they are in the menu (F1, the Screen tab) or in totk.ini.
+
+- **The DLSS mode** (dlss = quality, balanced, performance, ultra_performance, dlaa) scales the internal render size.
+  On the test machine (4K output), quality renders 2560x1440 and measured 78.7 drawn frames on average against 58.3 for
+  dlaa (native 4K). Balanced and performance go lower again and pay with a softer picture.
+- **The shadow settings** are the largest picture-side GPU cost: shadow_res (game to 2048), shadow_scale (1 to 4),
+  shadow_range (50 to 400), contact_shadows (0 to 100) and pcss (0 to 200). With every one of them at its maximum, the
+  same native-mode run went from 72 to 85% GPU use, 167 to 184 W and 58.3 to 53.3 drawn frames; the defaults cost much
+  less and look close at normal viewing distances.
+- **grass_range** (50 to 400) and **aniso** (game, 2 to 16) add GPU work over large parts of the world.
+- **dlss_fg_x** does not change the drawn frame rate target directly; it divides the frame limit (240 / x) and adds
+  generated pictures on top. A lower multiplier frees the game to draw faster and makes the flicker (below) less
+  noticeable.
+- A GPU with less headroom than an RTX 5070 Ti should start from dlss = balanced or performance, shadow_scale = 1 and
+  shadow_range = 100, and raise them until the frame times stop fitting.
+
 ### Known issue: whole-picture flicker with frame generation
 
 1. **Symptom.** With dlss_fg on, the whole picture flickers (the HUD and the game's own image together) in some areas.
