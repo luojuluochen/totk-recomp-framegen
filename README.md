@@ -99,11 +99,11 @@ menu_lang = zh-Hans
 
 1. **Symptom.** With dlss_fg on, the whole picture flickers (the HUD and the game's own image together) in some areas.
    The amplitude grows with dlss_fg_x: 2x is mild, 4x and 6x are clearly visible.
-2. **Where and how to reproduce.** At Lookout Landing, in view of the fort (the large fort north-west of the landing):
-   stand still with the camera still and watch the picture; it flickers within a second or two. The same view with
-   frame generation off (menu, F1) is steady. High-contrast spots elsewhere in the world show it too; most of the map
-   does not. (The exact map coordinates depend on the save; the view is what matters: fort, sky and cliff in the frame
-   at once.)
+2. **Where and how to reproduce.** Just outside the north gate of Lookout Landing, at about X -0231, Z 0020 (12 m
+   above sea level): the spot by the gate's wooden palisade and the lone tree beside it, with the fort wall, the banner
+   and the tree in the frame (the map view at X -0224, Z 0019 marks the same place). Stand still with the camera still
+   and watch the picture; it flickers within a second or two. The same view with frame generation off (menu, F1) is
+   steady. High-contrast spots elsewhere in the world show it too; most of the map does not.
 3. **Workarounds.** Keep the camera moving (the motion masks the flicker), turn frame generation off in the menu (F1)
    while playing in such an area, or use dlss_fg_x = 2, which makes it much less noticeable. Turning the scene upscaler
    off also stops it, but that also disables DLSS-G, which needs the upscaler.
