@@ -164,7 +164,16 @@ uint64_t frame_step_cap_ns(void) {
     // the pictures shown and the game draws half, 30 at least (Savage Wind's framepace_period_ns, PR #1089). Only
     // while the last frame went out with a generated picture: a menu or a fade, which has none, keeps the whole limit.
     // The real-time step follows the game's presents (frame_step_present), so it is the drawn frames' interval.
-    if (gfx_frame_gen_live()) hz = hz / 2 < LIMIT_MIN_HZ ? LIMIT_MIN_HZ : hz / 2;
+    // DLSS Frame Generation (vk_backend.c present_main) shows 2 to 6 pictures per drawn frame: the limit counts the
+    // pictures shown, so the game draws hz / pictures. 1 in every other case, the whole limit then.
+    int imgs = gfx_frame_gen_images();
+    if (imgs > 1) hz = hz / imgs < LIMIT_MIN_HZ ? LIMIT_MIN_HZ : hz / imgs;
+    else if (gfx_frame_gen_live()) hz = hz / 2 < LIMIT_MIN_HZ ? LIMIT_MIN_HZ : hz / 2;
+    static int logged_imgs = -1;
+    if (imgs != logged_imgs) {
+        logged_imgs = imgs;
+        rt_log("frame rate: %d picture(s) a game frame, drawing at %.1f Hz", imgs, hz);
+    }
     return (uint64_t)(1e9 / hz + 0.5);
 }
 

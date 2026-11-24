@@ -42,12 +42,18 @@
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
+#include "ui/menu.h"
 #include "vk_dlaa.h"
 #include "vk_fg.h"
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image, gen; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value, pid; } PresentJob;   // pid: the frame's present ID (vk_reflex_frame); gen: its generated picture (vk_fg_present_gen)
+typedef struct {
+    VkImage image, gen, interp[VK_DLSSG_MAX_GEN];
+    VkFormat format;
+    int w, h, has_crop, crop[4], interp_n;
+    uint64_t frame, at, queued, value, pid;   // pid: the frame's present ID (vk_reflex_frame); gen: its generated picture (vk_fg_present_gen)
+} PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -64,6 +70,7 @@ static void wait_until(uint64_t at) {
 // ---- Frame generation's presents (present thread only)
 static volatile int32_t fg_live;   // the last frame went out with a generated picture before it (gfx_frame_gen_live)
 int gfx_frame_gen_live(void) { return __atomic_load_n(&fg_live, __ATOMIC_RELAXED); }
+int gfx_frame_gen_images(void) { return vk_dlssg_images_per_frame(); }   // the configured multiplier while DLSS-G is on
 
 // Present intervals in the world while frame generation is on, logged every FS_EVERY presents and over the run: all of them, from
 // a generated picture to the game's frame after it, and from the game's frame to the next generated picture.
@@ -181,6 +188,17 @@ static void present_main(void *arg) {
         busy = 1;
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
+        if (j.interp_n > 0) {
+            uint64_t span = last && j.at > last ? j.at - last : 0;
+            for (int i = 0; i < j.interp_n; i++) {
+                if (!j.interp[i]) continue;
+                // 2x lands on the old midpoint. 3x and 4x split the same interval.
+                uint64_t at = span ? last + span * (uint64_t)(i + 1) / (uint64_t)(j.interp_n + 1) : 0;
+                vk_present_blit(j.interp[i], VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
+                if (at) wait_until(at);
+                vk_present_flip();
+            }
+        }
         if (flight_on) vk_thumbs_frame(j.frame);
         vk_reflex_present_frame(j.pid);   // the present of this blit, and the submission after it, are the frame's
         vk_reflex_submit_frame(j.pid);
@@ -235,7 +253,6 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
                           uint64_t value, uint64_t pid) {
     static volatile int32_t n_skipped;
     vk_exec_frame_log(t, frame);
-    vk_dlaa_frame();
     vk_mvsurvey_frame();
     vk_mvprev_frame();
     vk_mem_census(frame);
@@ -243,6 +260,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
     if (!img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        vk_dlaa_frame();
         if (plat_inc32(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
         if (value) {   // the queued value is still signalled, in order
@@ -264,6 +282,9 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
         for (int i = 0; i < 4; i++) j.crop[i] = crop[i];
     }
     vk_upload_flush(0);   // an upload vk_texture_get just recorded goes before the blit
+    if (!menu_is_open())
+        j.interp_n = vk_dlssg_evaluate(j.image, j.format, (uint32_t)j.w, (uint32_t)j.h, j.interp, VK_DLSSG_MAX_GEN);
+    vk_dlaa_frame();
     plat_mutex_lock(&pl);
     if (!present_thread) {
         if (!plat_thread_spawn(present_main, NULL, "vk present", 0)) rt_fatal("vk: cannot start the present thread");

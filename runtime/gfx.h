@@ -25,6 +25,7 @@ double gfx_window_refresh_hz(void);                        // refresh rate of th
 int gfx_window_focused(void);
 uint64_t gfx_presents_shown(void);   // gfx_present.c: presents queued since the start (two a frame with frame generation)
 int gfx_frame_gen_live(void);        // vk_backend.c: the last frame was shown with a generated picture before it
+int gfx_frame_gen_images(void);      // vk_backend.c: pictures shown for the last frame the game drew (DLSS-G; 1 without it)
 int gfx_picture_rect(float out[4]);   // where the last present put the picture, fractions of the swapchain (x, y, w, h); 0 before one
 void gfx_present_hold(int on);      // 1: the window keeps its last picture, nothing new is presented (quick load)
 // NVIDIA Reflex (gfx_present.c, VK_NV_low_latency2): the NVN front end and the input service mark a frame's stages.

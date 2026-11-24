@@ -29,11 +29,13 @@
 #include "vk_fsr3.h"
 #include "vk_rec.h"
 #include "dlaa_mv_spv.h"
+#include "fg_sky_spv.h"
 
 typedef int NgxResult;   // NVSDK_NGX_Result: 1 success, 0xBAD00000 | n failures
 #define NGX_OK(r) (((unsigned)(r) & 0xFFF00000u) != 0xBAD00000u)
 #define NGX_VERSION_API 0x15
 #define NGX_FEATURE_SUPERSAMPLING 1
+#define NGX_FEATURE_FRAMEGENERATION 11
 #define NGX_PERFQ_DLAA 5   // NVSDK_NGX_PerfQuality_Value: 0 performance, 1 balanced, 2 quality, 3 ultra performance
 typedef struct NgxParam NgxParam;
 typedef struct NgxHandle NgxHandle;
@@ -58,19 +60,32 @@ typedef NgxResult (*PFN_ReqExt)(unsigned *ni, const char ***ie, unsigned *nd, co
 typedef NgxResult (*PFN_Params)(NgxParam **);
 typedef NgxResult (*PFN_DestroyParams)(NgxParam *);
 typedef NgxResult (*PFN_Create)(VkCommandBuffer, int feature, NgxParam *, NgxHandle **);
+typedef NgxResult (*PFN_Create1)(VkDevice, VkCommandBuffer, int feature, NgxParam *, NgxHandle **);
 typedef NgxResult (*PFN_Evaluate)(VkCommandBuffer, const NgxHandle *, const NgxParam *, void *callback);
 typedef NgxResult (*PFN_Release)(NgxHandle *);
+typedef struct {
+    unsigned int SdkVersion;
+    int FeatureID;
+    struct { int Type; union { struct { const char *ProjectId; int EngineType; const char *EngineVersion; } ProjectDesc; } v; } Identifier;
+    const wchar_t *ApplicationDataPath;
+    const void *FeatureInfo;
+} NgxFeatureDiscoveryInfo;
+typedef NgxResult (*PFN_GetFeatInstExt)(const NgxFeatureDiscoveryInfo *, uint32_t *, VkExtensionProperties **);
+typedef NgxResult (*PFN_GetFeatDevExt)(VkInstance, VkPhysicalDevice, const NgxFeatureDiscoveryInfo *, uint32_t *, VkExtensionProperties **);
 
 static struct {
     void *core;   // the NGX core library (an HMODULE on Windows)
     PFN_Init init;
     PFN_ReqExt req_ext;
+    PFN_GetFeatInstExt feat_inst_ext;
+    PFN_GetFeatDevExt feat_dev_ext;
     PFN_Params caps, alloc_params;
     PFN_DestroyParams destroy_params;
     PFN_Create create;
+    PFN_Create1 create1;
     PFN_Evaluate evaluate;
     PFN_Release release;
-    int tried, loaded, available;
+    int tried, loaded, available, fg_available;
     int wanted;   // -1 not read yet
 } N = {.wanted = -1};
 
@@ -126,7 +141,7 @@ int vk_upscaler_on(void) {
 // with DLSS off. So the choice applies after a restart; with DLSS not picked (off or FSR 3.1), nothing of NGX runs.
 int vk_dlaa_wanted(void) {
     static int wanted = -1;
-    if (wanted < 0) wanted = vk_upscaler_engine() == UPSCALER_DLSS;
+    if (wanted < 0) wanted = vk_upscaler_engine() == UPSCALER_DLSS || cfg_bool("TOTK_DLSS_FG");
     return wanted;
 }
 
@@ -148,10 +163,13 @@ static int core_load(void) {
 #define FN(f, name) N.f = plat_lib_sym(N.core, name)
     FN(init, "NVSDK_NGX_VULKAN_Init_Ext2");
     FN(req_ext, "NVSDK_NGX_VULKAN_RequiredExtensions");
+    FN(feat_inst_ext, "NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements");
+    FN(feat_dev_ext, "NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements");
     FN(caps, "NVSDK_NGX_VULKAN_GetCapabilityParameters");
     FN(alloc_params, "NVSDK_NGX_VULKAN_AllocateParameters");
     FN(destroy_params, "NVSDK_NGX_VULKAN_DestroyParameters");
     FN(create, "NVSDK_NGX_VULKAN_CreateFeature");
+    FN(create1, "NVSDK_NGX_VULKAN_CreateFeature1");
     FN(evaluate, "NVSDK_NGX_VULKAN_EvaluateFeature");
     FN(release, "NVSDK_NGX_VULKAN_ReleaseFeature");
 #undef FN
@@ -174,12 +192,27 @@ void vk_dlaa_instance_exts(const char **ext, uint32_t *n, uint32_t max) {
     unsigned ni = 0, nd = 0;
     const char **ie = NULL, **de = NULL;
     if (!vk_dlaa_wanted() || !core_load() || !NGX_OK(N.req_ext(&ni, &ie, &nd, &de))) return;
-    for (unsigned i = 0; i < ni; i++)
+    for (unsigned i = 0; i < ni; i++) {
         if (!listed(ext, *n, ie[i]) && *n < max) ext[(*n)++] = ie[i];
+    }
+    if (N.feat_inst_ext) {
+        wchar_t wdir[PLAT_PATH_MAX];
+        if (plat_exe_dir_wide(wdir, PLAT_PATH_MAX)) {
+            NgxFeatureDiscoveryInfo di = {.SdkVersion = NGX_VERSION_API, .FeatureID = NGX_FEATURE_FRAMEGENERATION,
+                                          .ApplicationDataPath = wdir};
+            uint32_t fni = 0;
+            VkExtensionProperties *fie = NULL;
+            if (NGX_OK(N.feat_inst_ext(&di, &fni, &fie)) && fie) {
+                for (uint32_t i = 0; i < fni; i++) {
+                    if (!listed(ext, *n, fie[i].extensionName) && *n < max) ext[(*n)++] = fie[i].extensionName;
+                }
+            }
+        }
+    }
 }
 
-void vk_dlaa_device_exts(const VkExtensionProperties *have, uint32_t nhave, const char **ext, uint32_t *n,
-                         uint32_t max) {
+void vk_dlaa_device_exts(VkInstance inst, VkPhysicalDevice phys, const VkExtensionProperties *have, uint32_t nhave,
+                         const char **ext, uint32_t *n, uint32_t max) {
     unsigned ni = 0, nd = 0;
     const char **ie = NULL, **de = NULL;
     if (!vk_dlaa_wanted() || !core_load() || !NGX_OK(N.req_ext(&ni, &ie, &nd, &de))) return;
@@ -188,6 +221,28 @@ void vk_dlaa_device_exts(const VkExtensionProperties *have, uint32_t nhave, cons
         for (uint32_t k = 0; k < nhave && !ok; k++) ok = !strcmp(have[k].extensionName, de[i]);
         if (!ok) rt_log("dlaa: the device lacks %s, which NGX asks for", de[i]);
         else if (!listed(ext, *n, de[i]) && *n < max) ext[(*n)++] = de[i];
+    }
+    if (N.feat_dev_ext && inst && phys) {
+        wchar_t wdir[PLAT_PATH_MAX];
+        if (plat_exe_dir_wide(wdir, PLAT_PATH_MAX)) {
+            NgxFeatureDiscoveryInfo di = {.SdkVersion = NGX_VERSION_API, .FeatureID = NGX_FEATURE_FRAMEGENERATION,
+                                          .ApplicationDataPath = wdir};
+            uint32_t fnd = 0;
+            VkExtensionProperties *fde = NULL;
+            if (NGX_OK(N.feat_dev_ext(inst, phys, &di, &fnd, &fde)) && fde) {
+                for (uint32_t i = 0; i < fnd; i++) {
+                    int ok = 0;
+                    for (uint32_t k = 0; k < nhave && !ok; k++) ok = !strcmp(have[k].extensionName, fde[i].extensionName);
+                    if (ok && !listed(ext, *n, fde[i].extensionName) && *n < max) ext[(*n)++] = fde[i].extensionName;
+                }
+            }
+        }
+    }
+    static const char *const fg_extra[] = {"VK_NV_optical_flow", "VK_KHR_format_feature_flags2"};
+    for (size_t i = 0; i < sizeof fg_extra / sizeof fg_extra[0]; i++) {
+        int ok = 0;
+        for (uint32_t k = 0; k < nhave && !ok; k++) ok = !strcmp(have[k].extensionName, fg_extra[i]);
+        if (ok && !listed(ext, *n, fg_extra[i]) && *n < max) ext[(*n)++] = fg_extra[i];
     }
 }
 
@@ -214,9 +269,23 @@ static int vtable_ok(void) {
 // before the first frame: with no upscaler, or DLSS without NGX, it stays 0 as vk_dlaa_available does.
 static int objmv;
 
+typedef void (*PFN_NgxLogCallback)(const char *message, int loggingLevel, int sourceComponent);
+typedef struct {
+    struct { const wchar_t *const *Path; unsigned int Length; } PathListInfo;
+    void *InternalData;
+    struct {
+        PFN_NgxLogCallback LoggingCallback;
+        int MinimumLoggingLevel;
+        _Bool DisableOtherLoggingSinks;
+    } LoggingInfo;
+} NgxFeatureCommonInfo;
+
 void vk_dlaa_init(void) {
+    static int s_inited;
+    if (s_inited) return;
     objmv = vk_upscaler_engine() == UPSCALER_FSR3;
     if (!vk_dlaa_wanted() || !core_load()) return;
+    s_inited = 1;
     // The executable's folder, where NGX looks for the DLSS model library and writes its logs.
     wchar_t wdir[PLAT_PATH_MAX];
     if (!plat_exe_dir_wide(wdir, PLAT_PATH_MAX)) {
@@ -233,18 +302,30 @@ void vk_dlaa_init(void) {
     }
     if (!vtable_ok()) return;
     NgxParam *caps = NULL;
-    int avail = 0, driver = 0;
+    int ss_avail = -1, ss_driver = -1, ss_init_res = -1;
+    int ss_maj = -1, ss_min = -1, ss_bld = -1, ss_sub = -1;
+    int fg_avail = -1, fg_driver = -1, fg_init_res = -1;
     if (NGX_OK(N.caps(&caps)) && caps) {
-        p_geti(caps, "SuperSampling.Available", &avail);
-        p_geti(caps, "SuperSampling.NeedsUpdatedDriver", &driver);
+        p_geti(caps, "SuperSampling.Available", &ss_avail);
+        p_geti(caps, "SuperSampling.NeedsUpdatedDriver", &ss_driver);
+        p_geti(caps, "SuperSampling.FeatureInitResult", &ss_init_res);
+        p_geti(caps, "SuperSampling.MinDriverVersionMajor", &ss_maj);
+        p_geti(caps, "SuperSampling.MinDriverVersionMinor", &ss_min);
+        p_geti(caps, "SuperSampling.MinDriverVersionBuild", &ss_bld);
+        p_geti(caps, "SuperSampling.MinDriverVersionSubBuild", &ss_sub);
+        p_geti(caps, "FrameGeneration.Available", &fg_avail);
+        p_geti(caps, "FrameGeneration.NeedsUpdatedDriver", &fg_driver);
+        p_geti(caps, "FrameGeneration.FeatureInitResult", &fg_init_res);
     }
-    N.available = avail != 0;
+    N.available = ss_avail == 1;
+    N.fg_available = fg_avail == 1 || ss_avail == 1;
     objmv = N.available;   // vk_dlaa_available: wanted, and DLSS came up
-    rt_log("dlaa: NGX up; DLSS %s%s", avail ? "available" : "NOT available (is " DLSS_MODEL " next to the executable?)",
-           driver ? "; the driver needs an update" : "");
+    rt_log("dlaa: NGX up; DLSS %s%s; DLSS-G %s", N.available ? "available" : "NOT available (is " DLSS_MODEL " next to the executable?)",
+           ss_driver == 1 ? "; the driver needs an update" : "", N.fg_available ? "available" : "NOT available");
 }
 
 int vk_dlaa_available(void) { return vk_dlaa_wanted() && N.available; }
+int vk_dlssg_available(void) { return vk_dlaa_wanted() && N.fg_available; }
 
 // ---------------------------------------------------------------- where DLAA runs in TotK's frame
 // Measured (TOTK_DUMP, frame 2100 at Lookout Landing, 2560x1440 scene): the G-buffer passes draw into five targets with
@@ -298,6 +379,7 @@ static struct {
     int fx_on;                   // dlaa_effects_after, read at each present while DLSS runs
     int fx_seen, fx_open, fx_bad;   // this frame: the point found / the scene not ended since / drawn on after it
     uint32_t fx_steady;          // DLSS frames in a row with the point found and nothing of the scene after it
+    int fg_late;   // this frame's FG-only capture of a light target that came after the scene was ended   // this frame's FG-only capture of a light target that came after the scene was ended
     // jitter (vk_dlaa_viewport)
     VkImage jdepth;              // the scene depth of the last frame DLAA ran on: passes drawing with it are jittered
     float jx, jy;                // the offset the next scene draws take, render pixels (window x right, y down)
@@ -339,6 +421,17 @@ static struct {
     float cam_dr[2];             // the viewport depth range of the draw cam_addr was noted at
     int fg_mv_ok;                // the frame's motion is in the motion image (fg_motion)
     int fsr;                     // the engine is AMD FSR 3.1 (scene_upscaler = fsr3 at start), else DLSS
+    // DLSS Frame Generation (DLSS-G) per-frame scene state recorded during evaluate()
+    int fg_scene_ok;
+    VkImage fg_depth, fg_mv;
+    VkImageView fg_depth_view, fg_mv_view;
+    VkFormat fg_depth_fmt;
+    uint32_t fg_w, fg_h;
+    float fg_jx, fg_jy;
+    int fg_reset;
+    float fg_cam_raw[64];
+    int fg_cam_ok;
+    uint64_t fgc_cam_ok, fgc_cam_miss, fgc_scene_ok;   // frames counted (diagnostic)
 } D = {.mv_ok = -1, .cfg_seen = ~0u};
 #define DLSS_SIZES (sizeof D.sizes / sizeof D.sizes[0])
 
@@ -399,6 +492,21 @@ static int image2d(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, 
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = *img,
                                 .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = f,
                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    return vkCreateImageView(c->device, &vi, NULL, view) == VK_SUCCESS;
+}
+
+static int image2d_aspect(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                          VkImage *img, VmaAllocation *mem, VkImageView *view) {
+    const VkCtx *c = vk_ctx();
+    VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
+                            .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (vmaCreateImage(c->vma, &ii, &ai, img, mem, NULL) != VK_SUCCESS) return 0;
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = *img,
+                                .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = f,
+                                .subresourceRange = {aspect, 0, 1, 0, 1}};
     return vkCreateImageView(c->device, &vi, NULL, view) == VK_SUCCESS;
 }
 
@@ -670,7 +778,16 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
         return 0;
     }
     // this frame's view-projection as the snapshot holds it, for the reprojection; kept as last frame's for the next
-    const float *cr = (const float *)vk_usnap_bytes(D.cam_addr + 48, 64);
+    const float *cr_full = (const float *)vk_usnap_bytes(D.cam_addr, 256);
+    if (cr_full) {
+        memcpy(D.fg_cam_raw, cr_full, 256);
+        D.fg_cam_ok = 1;
+        D.fgc_cam_ok++;
+    } else {
+        D.fg_cam_ok = 0;
+        D.fgc_cam_miss++;
+    }
+    const float *cr = cr_full ? cr_full + 12 : (const float *)vk_usnap_bytes(D.cam_addr + 48, 64);
     double cur_vp[16], m[16], ci[16];
     int have_m = 0;
     float osx = 0.0f, osy = 0.0f;
@@ -1343,6 +1460,142 @@ static int fsr_evaluate(VkExec *ex, struct Size *e, const VkExecTarget *t, const
     return 1;
 }
 
+// ---------------------------------------------------------------- DLSS Frame Generation (DLSS-G, TOTK_DLSS_FG)
+#define FG_SLOTS 3
+#define FG_MAX_GEN VK_DLSSG_MAX_GEN   // 6x: five generated frames. Lower multipliers use the front of that
+static struct {
+    int on, failed, reset;
+    uint32_t ow, oh, sw, sh, internal_w, internal_h;
+    VkFormat fmt;
+    NgxHandle *feat;
+    NgxParam *params;
+    VkSemaphore timeline_sem;
+    VkCommandPool pool;
+    VkCommandBuffer cb[FG_SLOTS];
+    VkFence fence[FG_SLOTS];
+    VkImage out[FG_SLOTS][FG_MAX_GEN];
+    VmaAllocation out_mem[FG_SLOTS][FG_MAX_GEN];
+    VkImageView out_view[FG_SLOTS][FG_MAX_GEN];
+    uint32_t created_max;    // MultiFrameCountMax the feature was created with
+    VkImage bb_img[FG_SLOTS];
+    VkFormat bb_fmt[FG_SLOTS];
+    VkImageView bb_view[FG_SLOTS];
+
+    // The frame's own copies of the scene depth and motion vectors (fg_snapshot), one per slot in flight
+    VkImage snap_depth[FG_SLOTS];
+    VmaAllocation snap_depth_mem[FG_SLOTS];
+    VkImageView snap_depth_view[FG_SLOTS];
+    VkImage snap_mv[FG_SLOTS];
+    VmaAllocation snap_mv_mem[FG_SLOTS];
+    VkImageView snap_mv_view[FG_SLOTS];
+    uint32_t snap_w, snap_h, snap_n;
+    uint32_t snap_seen;   // snap_n at the last evaluation: a present with the same count has no new scene
+    uint64_t stale;       // presents that went out without generated images for that reason
+    VkFormat snap_fmt;
+
+    uint32_t slot;
+    uint64_t evals, ready_count, missed_scene;
+    VkDescriptorSetLayout sky_dsl;
+    VkPipelineLayout sky_layout;
+    VkPipeline sky_pipe;
+    VkSampler sky_samp;
+    int sky_ok;
+    float cam_view_to_clip[16];
+    float cam_clip_to_view[16];
+    float cam_clip_to_prev_clip[16];
+    float cam_prev_clip_to_clip[16];
+    float cam_prev_vp[16];
+    int cam_prev_ok;
+} FG;
+
+static void fg_mat4_from_rows(const float *r0, const float *r1, const float *r2, const float *r3, double m[16]) {
+    for (int k = 0; k < 4; k++) {
+        m[0 * 4 + k] = r0[k];
+        m[1 * 4 + k] = r1[k];
+        m[2 * 4 + k] = r2[k];
+        m[3 * 4 + k] = r3[k];
+    }
+}
+
+static void fg_mat4_mul(const double a[16], const double b[16], double o[16]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            double v = 0;
+            for (int k = 0; k < 4; k++) v += a[r * 4 + k] * b[k * 4 + c];
+            o[r * 4 + c] = v;
+        }
+}
+
+static void fg_mat4_to_float(const double m[16], float o[16]) {
+    for (int i = 0; i < 16; i++) o[i] = (float)m[i];
+}
+
+static void fg_free_snaps(const VkCtx *c) {
+    for (int i = 0; i < FG_SLOTS; i++) {
+        if (FG.snap_depth_view[i]) vkDestroyImageView(c->device, FG.snap_depth_view[i], NULL), FG.snap_depth_view[i] = VK_NULL_HANDLE;
+        if (FG.snap_depth[i]) vmaDestroyImage(c->vma, FG.snap_depth[i], FG.snap_depth_mem[i]), FG.snap_depth[i] = VK_NULL_HANDLE;
+        if (FG.snap_mv_view[i]) vkDestroyImageView(c->device, FG.snap_mv_view[i], NULL), FG.snap_mv_view[i] = VK_NULL_HANDLE;
+        if (FG.snap_mv[i]) vmaDestroyImage(c->vma, FG.snap_mv[i], FG.snap_mv_mem[i]), FG.snap_mv[i] = VK_NULL_HANDLE;
+    }
+    FG.snap_w = FG.snap_h = 0;
+    D.fg_depth = D.fg_mv = VK_NULL_HANDLE, D.fg_depth_view = D.fg_mv_view = VK_NULL_HANDLE, D.fg_scene_ok = 0;
+}
+
+// Frame generation reads the scene depth and the motion vectors after the frame was submitted, on its own command buffer.
+// By then the game may have drawn over the depth again and a scene-size entry may have been freed, so it works from copies
+// of its own, made here in the order of the frame: right after the pass that wrote them. A ring of FG_SLOTS keeps the copy
+// an earlier generation still reads from being overwritten (the copy waits for it through the barrier, as both run on
+// the one queue). Does nothing, and costs nothing, while frame generation is off. Returns 0 when there is no copy.
+static int fg_snapshot(VkCommandBuffer cb, VkImage depth, VkFormat dfmt, VkImage mv, uint32_t w, uint32_t h) {
+    if (!cfg_bool("TOTK_DLSS_FG")) return 0;
+    const VkCtx *c = vk_ctx();
+    if (FG.snap_depth[0] && (FG.snap_w != w || FG.snap_h != h || FG.snap_fmt != dfmt)) {
+        vkDeviceWaitIdle(c->device);   // another scene size: the old copies may still be read
+        fg_free_snaps(c);
+    }
+    if (!FG.snap_depth[0]) {
+        VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        VkImageMemoryBarrier2 b[2 * FG_SLOTS];
+        for (int i = 0; i < FG_SLOTS; i++) {
+            if (!image2d_aspect(w, h, dfmt, u, VK_IMAGE_ASPECT_DEPTH_BIT, &FG.snap_depth[i], &FG.snap_depth_mem[i],
+                                &FG.snap_depth_view[i]) ||
+                !image2d_aspect(w, h, VK_FORMAT_R16G16_SFLOAT, u, VK_IMAGE_ASPECT_COLOR_BIT, &FG.snap_mv[i], &FG.snap_mv_mem[i],
+                                &FG.snap_mv_view[i])) {
+                rt_log("dlssg: the depth and motion vector copies could not be made: DLSS-G off");
+                vkDeviceWaitIdle(c->device);
+                fg_free_snaps(c);
+                FG.failed = 1;
+                return 0;
+            }
+            for (int k = 0; k < 2; k++)
+                b[2 * i + k] = (VkImageMemoryBarrier2){
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                    .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                    .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = k ? FG.snap_mv[i] : FG.snap_depth[i],
+                    .subresourceRange = {k ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}};
+        }
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2 * FG_SLOTS,
+                               .pImageMemoryBarriers = b};
+        vkCmdPipelineBarrier2(cb, &di);
+        FG.snap_w = w, FG.snap_h = h, FG.snap_fmt = dfmt;
+    }
+    uint32_t i = FG.snap_n++ % FG_SLOTS;
+    full_barrier(cb);   // the pass that wrote the depth and the vectors, and whatever still reads this slot
+    VkImageCopy dc = {.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
+                      .extent = {w, h, 1}};
+    VkImageCopy mc = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                      .extent = {w, h, 1}};
+    vkCmdCopyImage(cb, depth, VK_IMAGE_LAYOUT_GENERAL, FG.snap_depth[i], VK_IMAGE_LAYOUT_GENERAL, 1, &dc);
+    vkCmdCopyImage(cb, mv, VK_IMAGE_LAYOUT_GENERAL, FG.snap_mv[i], VK_IMAGE_LAYOUT_GENERAL, 1, &mc);
+    full_barrier(cb);
+    D.fg_depth = FG.snap_depth[i], D.fg_depth_view = FG.snap_depth_view[i], D.fg_depth_fmt = dfmt;
+    D.fg_mv = FG.snap_mv[i], D.fg_mv_view = FG.snap_mv_view[i];
+    return 1;
+}
+
 // dst: the target DLSS's picture goes to, NULL for the light target itself (DLAA in place).
 static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     const VkExecTarget *t = &D.color, *z = &D.depth;
@@ -1420,6 +1673,18 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
                "%d)", w, h, ow, oh, q, 'A' + pr - 1, (int)t->format, (int)z->format);
     }
     if (D.last_color != t->image) D.reset = 1, D.why[2]++, D.last_color = t->image;
+    if (D.reset) D.fg_reset = 1;
+    D.fg_scene_ok = 1;
+    D.fgc_scene_ok++;
+    if (D.fgc_scene_ok % 300 == 0)
+        rt_log("dlaa_fg: scene_ok=%llu cam_ok=%llu cam_miss=%llu (frames with the DLAA point)",
+               (unsigned long long)D.fgc_scene_ok, (unsigned long long)D.fgc_cam_ok, (unsigned long long)D.fgc_cam_miss);
+    if (fg_snapshot(cb, z->image, z->format, e->mv, w, h)) {
+        D.fg_w = w, D.fg_h = h;
+        D.fg_jx = jx, D.fg_jy = jy;
+    } else {
+        D.fg_scene_ok = 0;
+    }
     NgxResourceVK rc = res_image(cv, t->image, t->format, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
     NgxResourceVK ro = res_image(e->out_view, e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, 1);
     NgxResourceVK rz = res_image(zv, z->image, z->format, w, h, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
@@ -1591,6 +1856,43 @@ static void fx_watch(const VkExec *ex) {
     if (geometry || (light && z->image && z->image == D.light_z)) D.fx_seen = D.fx_open = 0, D.fx_bad = 1;
 }
 
+// The pass DLSS does not upscale (the title's 1280x720 buffer) still has the scene
+// depth and camera. Record motion vectors for DLSS-G and leave the picture to the
+// game's scaler. D.done stays clear so an unresolved jitter does not stay on screen.
+static void fg_capture(VkExec *ex) {
+    const VkExecTarget *t = &D.color, *z = &D.depth;
+    uint32_t w = t->width, h = t->height;
+    unsigned o[2], s[2];
+    res_sizes(o, s);
+    if (!w || !h || !o[0] || !o[1] || !z->image) return;
+    VkCommandBuffer cb = ex->cb;
+    vk_exec_barrier(ex);
+    struct Size *e = size_for(cb, w, h, o[0], o[1], 0);
+    if (!e) return;
+    VkImageView zv = vk_exec_target_view(z->img, z->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, z->level,
+                                         z->base_layer, 1, 0);
+    float jx = D.jit_used ? D.ux : 0.0f, jy = D.jit_used ? D.uy : 0.0f;
+    // A later, smaller pass must not replace the scene capture. Its nearest
+    // downsample was handing thin blades the background sample.
+    if (D.done && D.fg_w >= w && D.fg_h >= h) return;
+    int masked = 0;
+    if (!mv_pass(ex, e, zv, jx, jy, char_bias(), &masked, 1)) {
+        VkClearColorValue zero = {{0, 0, 0, 0}};
+        VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, e->mv, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+        full_barrier(cb);
+    }
+    if (!fg_snapshot(cb, z->image, z->format, e->mv, w, h)) {
+        D.fg_scene_ok = 0;
+        return;
+    }
+    D.fg_scene_ok = 1;
+    D.fg_w = w;
+    D.fg_h = h;
+    D.fg_jx = jx;
+    D.fg_jy = jy;
+}
+
 int vk_dlaa_plan(const VkExec *ex, VkExecJob *j) {
     const VkExecTarget *c = &ex->color[0], *z = &ex->depth;
     if (D.fx_open && dl_active()) fx_watch(ex);
@@ -1658,6 +1960,17 @@ int vk_dlaa_plan(const VkExec *ex, VkExecJob *j) {
         *j = (VkExecJob){.kind = VK_JOB_DLSS_MASK, .scene = *c};   // the lit scene, before the transparents (reactive mask)
         return 1;
     }
+    // The light target with the scene depth came after the scene was ended (a scene-size pass without depth and a bloom pass before it:
+    // the inventory's order, which the game also uses in about half the frames of the world). DLAA does not run on such a frame, but
+    // its depth and motion vectors are as good as any, and without them frame generation had nothing new to work from. Only the
+    // capture for frame generation is made, once per frame, and only while frame generation is on.
+    if (D.gbuf && D.ended && !D.armed && !D.fg_late && ex->pass_ncolor == 1 && c->image && scene_color(c->format) && z->image &&
+        z->format == VK_FORMAT_D32_SFLOAT && c->width == z->width && c->height == z->height && c->width >= DLAA_SCENE_MIN_W &&
+        c->width >= D.gbuf_w && c->samples <= 1 && !c->is3d && cfg_bool("TOTK_DLSS_FG")) {
+        D.color = *c, D.depth = *z, D.fg_late = 1;
+        *j = (VkExecJob){.kind = VK_JOB_FG_CAPTURE};
+        return 1;
+    }
     if (!D.armed) return 0;
     if (!D.ended) {
         // The bloom chain's first pass ends the scene (bloom_start). With the camera rune or the scope open the game
@@ -1680,6 +1993,23 @@ int vk_dlaa_plan(const VkExec *ex, VkExecJob *j) {
     res_sizes(o, s);
     if (ex->pass_ncolor == 1 && c->image && !z->image && scene_color(c->format) && c->width > D.color.width &&
         c->width == o[0] && c->height == o[1] && c->samples <= 1 && !c->is3d) {
+        // Quality writes the patch page as 1280x720 so the game can scale it to a 2560x1440 scene.
+        // The title then draws that page size. Upscaling it replaces the picture with a cropped green
+        // frame. A pass near the configured scene still goes through DLSS. Native DLAA keeps the
+        // half-output pass (1920x1080 under 3840x2160), which already matches the stone wall.
+        int near_scene = s[0] < 32 || (D.color.width * 10 >= s[0] * 7 && D.color.height * 10 >= s[1] * 7);
+        int native = s[0] + 8 >= o[0] && s[1] + 8 >= o[1];
+        int half_out = native && D.color.width * 20 >= o[0] * 9 && D.color.width * 20 <= o[0] * 11 &&
+                       D.color.height * 20 >= o[1] * 9 && D.color.height * 20 <= o[1] * 11;
+        if (!near_scene && !half_out) {
+            static int logged;
+            if (!logged) {
+                logged = 1;
+                rt_log("dlaa: skip %ux%u (scene %ux%u); the game scales this pass", D.color.width, D.color.height, s[0], s[1]);
+            }
+            *j = (VkExecJob){.kind = VK_JOB_FG_CAPTURE};
+            return 1;
+        }
         D.done = 1;
         *j = (VkExecJob){.kind = VK_JOB_DLSS, .scene = *c};
         return 1;
@@ -1818,6 +2148,11 @@ void vk_dlaa_exec(VkExec *ex, const VkExecJob *j) {
         target_now(&t), target_now(&D.color), target_now(&D.depth);
         if (D.ids_ok) target_now(&D.ids);
     }
+    if (j->kind == VK_JOB_FG_CAPTURE) {
+        if (ex->chunked) target_now(&D.color), target_now(&D.depth);
+        fg_capture(ex);
+        return;
+    }
     if (j->kind == VK_JOB_DLSS_MASK) return mask_snapshot(ex, &t);
     if (!dl_active()) return fg_motion(ex);
     if (!t.tex) return evaluate(ex, NULL);
@@ -1879,12 +2214,13 @@ void vk_dlaa_frame(void) {
         rt_log("fg: frame generation off while FSR 3.1 upscales the scene (scene_upscaler = fsr3)");
     int fg = fsr && on ? 0 : vk_fg_wanted(on && !D.failed);
     D.bloom = D.hud = D.hud_wait = D.fin = D.gen = D.fg_mv_ok = 0;
+    D.fg_late = 0;
     if (on != D.on || fg != D.fg) {
         if (on != D.on) rt_log("dlaa: %s", on ? (fsr ? "on with FSR 3.1" : "on") : "off");
         if (fg != D.fg) rt_log("dlaa: the scene is %s for frame generation", fg ? "followed" : "no longer followed");
         D.on = on, D.fg = vk_dlaa_fg_on = fg, D.fsr = fsr;
         // either way the next DLAA frame starts a new history from an unjittered frame
-        D.reset = 1, D.cam_prev_ok = 0, D.jit_ok = D.jit_used = D.armed = D.done = D.gbuf = D.ended = D.up = 0;
+        D.reset = 1, D.fg_reset = 1, D.fg_scene_ok = 0, D.cam_prev_ok = 0, D.jit_ok = D.jit_used = D.armed = D.done = D.gbuf = D.ended = D.up = 0;
         D.fx_seen = D.fx_open = D.fx_bad = 0, D.fx_steady = 0;
         D.nodepth = D.glight = D.light_z = VK_NULL_HANDLE;
         D.hold = 0;
@@ -2024,5 +2360,631 @@ int vk_dlaa_skip_draw(VkExec *ex, const GfxShader *fs) {
         rt_log("dlaa: fxaa = 0 skips the game's FXAA (fragment shader %016llx)", (unsigned long long)h);
     }
     return !fxaa;
+}
+
+// ---------------------------------------------------------------- DLSS Frame Generation (DLSS-G, TOTK_DLSS_FG)
+static void fg_free_outputs(const VkCtx *c) {
+    for (int i = 0; i < FG_SLOTS; i++) {
+        if (FG.bb_view[i]) vkDestroyImageView(c->device, FG.bb_view[i], NULL), FG.bb_view[i] = VK_NULL_HANDLE;
+        FG.bb_img[i] = VK_NULL_HANDLE, FG.bb_fmt[i] = VK_FORMAT_UNDEFINED;
+        for (int g = 0; g < FG_MAX_GEN; g++) {
+            if (FG.out_view[i][g]) vkDestroyImageView(c->device, FG.out_view[i][g], NULL), FG.out_view[i][g] = VK_NULL_HANDLE;
+            if (FG.out[i][g]) vmaDestroyImage(c->vma, FG.out[i][g], FG.out_mem[i][g]), FG.out[i][g] = VK_NULL_HANDLE;
+        }
+    }
+}
+
+#if defined(_WIN32)
+#define DLSSG_CALL __cdecl
+#else
+#define DLSSG_CALL
+#endif
+
+static NgxResult DLSSG_CALL fg_cb_create_sync(void *cb_data, void **out_sync, void *arg3, void *arg4, void *arg5) {
+    if (!out_sync) return 0xBAD00005;
+    *out_sync = cb_data ? cb_data : (void *)&FG;
+    return 0;
+}
+
+static NgxResult DLSSG_CALL fg_cb_sync_signal(void *cb_data, void *sync_obj, uint64_t val, void *queue) {
+    const VkCtx *c = vk_ctx();
+    if (!c || !c->device) return 0;
+    VkSemaphore sem = FG.timeline_sem ? FG.timeline_sem : c->timeline;
+    if (!sem) return 0;
+    VkSemaphoreSignalInfo sig = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+        .semaphore = sem,
+        .value = val
+    };
+    vkSignalSemaphore(c->device, &sig);
+    return 0;
+}
+
+static NgxResult DLSSG_CALL fg_cb_sync_wait(void *cb_data, void *sync_obj, uint64_t val, void *queue, uint32_t flags, uint64_t timeout_ns, void *reserved) {
+    const VkCtx *c = vk_ctx();
+    if (!c || !c->device) return 0;
+    VkSemaphore sem = FG.timeline_sem ? FG.timeline_sem : c->timeline;
+    if (!sem) return 0;
+    VkSemaphoreWaitInfo wi = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .semaphoreCount = 1,
+        .pSemaphores = &sem,
+        .pValues = &val
+    };
+    VkResult vr = vkWaitSemaphores(c->device, &wi, timeout_ns ? timeout_ns : UINT64_MAX);
+    return (vr == VK_SUCCESS) ? 0 : 0xBAD00002;
+}
+
+static NgxResult DLSSG_CALL fg_cb_sync_flush(void *cb_data, void *sync_obj, void *queue) {
+    const VkCtx *c = vk_ctx();
+    if (!c || !c->device) return 0;
+    VkQueue q = queue ? (VkQueue)queue : c->gfx_queue;
+    if (q) {
+        vk_queue_lock();
+        vkQueueWaitIdle(q);
+        vk_queue_unlock();
+    }
+    return 0;
+}
+
+// NGX asks for these callbacks when the feature is created; this port runs it on its own command buffer and queue, so
+// the submit and the signal-only/wait-only hooks have nothing to do.
+static NgxResult DLSSG_CALL fg_cb_queue_submit(void *cb_data, void *cmd_or_info, void *queue, void *reserved) {
+    return 0;
+}
+
+static NgxResult DLSSG_CALL fg_cb_sync_signal_only(void *cb_data) {
+    return 0;
+}
+
+static NgxResult DLSSG_CALL fg_cb_sync_wait_only(void *cb_data) {
+    return 0;
+}
+
+// Tears the feature and everything built for it down; the device must be idle (the caller waited or holds it idle).
+static void fg_destroy(const VkCtx *c) {
+    fg_free_outputs(c);
+    fg_free_snaps(c);
+    if (FG.feat && N.release) N.release(FG.feat), FG.feat = NULL;
+    if (FG.params && N.destroy_params) N.destroy_params(FG.params), FG.params = NULL;
+    for (int i = 0; i < FG_SLOTS; i++)
+        if (FG.fence[i]) vkDestroyFence(c->device, FG.fence[i], NULL), FG.fence[i] = VK_NULL_HANDLE;
+    if (FG.pool) vkDestroyCommandPool(c->device, FG.pool, NULL), FG.pool = VK_NULL_HANDLE;
+    if (FG.timeline_sem) vkDestroySemaphore(c->device, FG.timeline_sem, NULL), FG.timeline_sem = VK_NULL_HANDLE;
+    if (FG.sky_pipe) vkDestroyPipeline(c->device, FG.sky_pipe, NULL);
+    if (FG.sky_layout) vkDestroyPipelineLayout(c->device, FG.sky_layout, NULL);
+    if (FG.sky_dsl) vkDestroyDescriptorSetLayout(c->device, FG.sky_dsl, NULL);
+    if (FG.sky_samp) vkDestroySampler(c->device, FG.sky_samp, NULL);
+    memset(&FG, 0, sizeof FG);
+}
+
+void vk_dlssg_release(void) {
+    const VkCtx *c = vk_ctx();
+    if (!c || !c->device) return;
+    vk_present_drain();
+    vk_queue_lock();
+    vkDeviceWaitIdle(c->device);
+    vk_queue_unlock();
+    fg_destroy(c);
+}
+
+// gfx_present.c build_swapchain: the old swapchain's images go away, and DLSS-G keeps the previous frame's backbuffer,
+// so its feature and views must go before them. The caller is device-idle with the queue locked.
+void vk_dlssg_release_idle(void) {
+    const VkCtx *c = vk_ctx();
+    if (c && c->device) fg_destroy(c);
+}
+
+// The sky is drawn over a depth that is still the far-plane clear, so frame
+// generation warps it and the real frame puts it back. Copy the real sky onto
+// each generated image. Solids, which have written depth, stay generated.
+static int fg_sky_init(void) {
+    if (FG.sky_ok) return FG.sky_ok > 0;
+    const VkCtx *c = vk_ctx();
+    FG.sky_ok = -1;
+    VkDescriptorSetLayoutBinding b[3] = {
+        {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+    VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                           .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                                           .bindingCount = 3, .pBindings = b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
+    VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
+                              .minFilter = VK_FILTER_NEAREST, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                              .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                              .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                              .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                   .codeSize = sizeof fg_sky_spv, .pCode = fg_sky_spv};
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(c->device, &dci, NULL, &FG.sky_dsl) != VK_SUCCESS) goto fail;
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                     .pSetLayouts = &FG.sky_dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+    if (vkCreatePipelineLayout(c->device, &li, NULL, &FG.sky_layout) != VK_SUCCESS ||
+        vkCreateSampler(c->device, &si, NULL, &FG.sky_samp) != VK_SUCCESS ||
+        vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS)
+        goto fail;
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = FG.sky_layout,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"}};
+    if (vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &FG.sky_pipe) != VK_SUCCESS) goto fail;
+    vkDestroyShaderModule(c->device, m, NULL);
+    FG.sky_ok = 1;
+    rt_log("dlssg: sky is copied from the real frame");
+    return 1;
+fail:
+    if (m) vkDestroyShaderModule(c->device, m, NULL);
+    rt_log("dlssg: sky stamp unavailable");
+    return 0;
+}
+
+static void fg_sky_stamp(VkCommandBuffer cb, uint32_t slot, int g, uint32_t ow, uint32_t oh) {
+    if (!D.fg_depth_view || !FG.bb_view[slot] || !FG.out_view[slot][g] || !fg_sky_init()) return;
+    VkDescriptorImageInfo depth = {FG.sky_samp, D.fg_depth_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo color = {FG.sky_samp, FG.bb_view[slot], VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo out = {VK_NULL_HANDLE, FG.out_view[slot][g], VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[3] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &depth},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &color},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &out}};
+    struct { uint32_t w, h; float cut; } pc = {ow, oh, 0.02f};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, FG.sky_pipe);
+    vk_pipeline_push_fn()(cb, VK_PIPELINE_BIND_POINT_COMPUTE, FG.sky_layout, 0, 3, wr);
+    vkCmdPushConstants(cb, FG.sky_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cb, (ow + 7) / 8, (oh + 7) / 8, 1);
+}
+
+// Generated frames for the fixed multiplier. 2x is 1 ... 6x is 5. Anything else stays 2x.
+static int fg_gens(void) {
+    const char *v = cfg_value("TOTK_DLSS_FG_X");
+    if (v && !strcmp(v, "3")) return 2;
+    if (v && !strcmp(v, "4")) return 3;
+    if (v && !strcmp(v, "5")) return 4;
+    if (v && !strcmp(v, "6")) return 5;
+    return 1;
+}
+
+// c4[14].y in the scene uniform block. Out of range keeps the old constant.
+static float fg_camera_far(const float *cr) {
+    float far = cr ? cr[57] : 0.0f;
+    if (!(far > 1.0f) || far > 1.0e7f) return 10000.0f;
+    return far;
+}
+
+int vk_dlssg_images_per_frame(void) { return FG.on ? fg_gens() + 1 : 1; }
+
+int vk_dlssg_evaluate(VkImage backbuffer, VkFormat fmt, uint32_t ow, uint32_t oh, VkImage *out_interps, int out_cap) {
+    if (out_cap > 0 && out_interps) out_interps[0] = VK_NULL_HANDLE;
+    if (!out_interps || out_cap < 1) return 0;
+    int want = N.fg_available && !FG.failed && cfg_bool("TOTK_DLSS_FG");
+    if (want != FG.on) {
+        rt_log("dlssg: %s", want ? "on" : "off");
+        FG.on = want;
+        FG.reset = 1;
+        FG.cam_prev_ok = 0;
+        if (!want) return 0;
+    }
+    if (!want || !backbuffer || !ow || !oh) return 0;
+    if (!D.fg_scene_ok || !D.fg_depth || !D.fg_mv || !D.fg_depth_view || !D.fg_mv_view ||
+        !D.fg_cam_ok || !D.fg_w || !D.fg_h) {
+        FG.missed_scene++;
+        if (FG.missed_scene == 1 || FG.missed_scene % 300 == 0)
+            rt_log("dlssg: no scene yet (%llu) scene=%d cam=%d depth=%p mv=%p",
+                   (unsigned long long)FG.missed_scene, D.fg_scene_ok, D.fg_cam_ok,
+                   (void *)D.fg_depth, (void *)D.fg_mv);
+        FG.reset = 1;
+        D.fg_scene_ok = 0;
+        return 0;
+    }
+    // Only a present that has a scene captured since the last evaluation is interpolated. A present without one (the
+    // game drew no scene for it) would be warped with the depth and vectors of an earlier frame, and the generated
+    // images would shift by the motion of that frame.
+    if (FG.snap_seen == FG.snap_n) {
+        FG.stale++;
+        return 0;
+    }
+    FG.snap_seen = FG.snap_n;
+    const VkCtx *c = vk_ctx();
+    if (!FG.pool) {
+        VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                       .queueFamilyIndex = c->gfx_family};
+        if (vkCreateCommandPool(c->device, &pci, NULL, &FG.pool) != VK_SUCCESS) {
+            rt_log("dlssg: command pool creation failed: DLSS-G off");
+            FG.failed = 1;
+            return 0;
+        }
+        VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                           .commandPool = FG.pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                           .commandBufferCount = FG_SLOTS};
+        if (vkAllocateCommandBuffers(c->device, &cai, FG.cb) != VK_SUCCESS) {
+            rt_log("dlssg: command buffer allocation failed: DLSS-G off");
+            FG.failed = 1;
+            return 0;
+        }
+        VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT};
+        for (int i = 0; i < FG_SLOTS; i++)
+            if (vkCreateFence(c->device, &fci, NULL, &FG.fence[i]) != VK_SUCCESS) {
+                FG.failed = 1;
+                return 0;
+            }
+    }
+    if (!FG.params && (!NGX_OK(N.alloc_params(&FG.params)) || !FG.params)) {
+        rt_log("dlssg: parameter allocation failed: DLSS-G off");
+        FG.failed = 1;
+        return 0;
+    }
+
+    uint32_t slot = FG.slot++ % FG_SLOTS;
+    if (vkWaitForFences(c->device, 1, &FG.fence[slot], VK_TRUE, 5000000000ull) != VK_SUCCESS) {
+        rt_log("dlssg: fence wait timed out");
+        return 0;
+    }
+    vkResetFences(c->device, 1, &FG.fence[slot]);
+    VkCommandBuffer cb = FG.cb[slot];
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(cb, &bi);
+
+    uint32_t sw = D.fg_w, sh = D.fg_h;
+    if (!sw || !sh) sw = ow, sh = oh;
+    int gens = fg_gens();
+    if (gens > out_cap) gens = out_cap;
+    if (gens > FG_MAX_GEN) gens = FG_MAX_GEN;
+    if (gens < 1) gens = 1;
+    static int logged_gens;
+    if (gens != logged_gens) {
+        logged_gens = gens;
+        rt_log("dlssg: fixed multiplier %dx", gens + 1);
+    }
+
+    if (FG.feat && (FG.ow != ow || FG.oh != oh || FG.fmt != fmt || FG.created_max < (uint32_t)gens ||
+                      FG.sw != sw || FG.sh != sh)) {   // the internal (scene) size is fixed at creation (dynamic resolution)
+        vk_present_drain();   // the present thread may still blit the images about to be freed
+        vk_queue_lock();
+        vkDeviceWaitIdle(c->device);
+        vk_queue_unlock();
+        fg_free_outputs(c);
+        N.release(FG.feat);
+        FG.feat = NULL;
+        FG.created_max = 0;
+    }
+    {
+        VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        VkImageMemoryBarrier2 ib[FG_SLOTS * FG_MAX_GEN];
+        int nb = 0;
+        for (int i = 0; i < FG_SLOTS; i++) {
+            for (int g = 0; g < gens; g++) {
+                if (FG.out[i][g]) continue;
+                if (!image2d(ow, oh, fmt, u, &FG.out[i][g], &FG.out_mem[i][g], &FG.out_view[i][g])) {
+                    rt_log("dlssg: output image (%ux%u fmt %d) creation failed: DLSS-G off", ow, oh, (int)fmt);
+                    FG.failed = 1;
+                    vkEndCommandBuffer(cb);
+                    return 0;
+                }
+                ib[nb++] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                                   .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                                   .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                                   .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                                   .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = FG.out[i][g],
+                                                   .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+            }
+        }
+        if (nb) {
+            VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = (uint32_t)nb,
+                                   .pImageMemoryBarriers = ib};
+            vkCmdPipelineBarrier2(cb, &di);
+        }
+        FG.ow = ow, FG.oh = oh, FG.fmt = fmt;
+    }
+
+    NgxParam *p = FG.params;
+    if (!FG.feat) {
+        if (!FG.timeline_sem) {
+            VkSemaphoreTypeCreateInfo st = {
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+                .initialValue = 0
+            };
+            VkSemaphoreCreateInfo si = {
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                .pNext = &st
+            };
+            if (vkCreateSemaphore(c->device, &si, NULL, &FG.timeline_sem) != VK_SUCCESS) {
+                rt_log("dlssg: timeline semaphore creation failed");
+                FG.timeline_sem = VK_NULL_HANDLE;
+            }
+        }
+        p_setu(p, "CreationNodeMask", 1);
+        p_setu(p, "VisibilityNodeMask", 1);
+        p_setu(p, "Width", ow);
+        p_setu(p, "Height", oh);
+        p_setu(p, "DLSSG.Width", ow);
+        p_setu(p, "DLSSG.Height", oh);
+        p_seti(p, "DLSSG.SynchronousInit", 0);
+        p_setu(p, "DLSSG.InternalWidth", sw);
+        p_setu(p, "DLSSG.InternalHeight", sh);
+        p_setu(p, "DLSSG.MaxDynamicWidth", ow > sw ? ow : sw);
+        p_setu(p, "DLSSG.MaxDynamicHeight", oh > sh ? oh : sh);
+        p_setu(p, "DLSSG.BackbufferFormat", (unsigned)fmt);
+        p_setu(p, "DLSSG.MultiFrameCountMax", (unsigned)gens);
+        p_seti(p, "DLSSG.DynamicResolution", 0);
+        p_setu(p, "DLSSG.BackbufferSubrectWidth", ow);
+        p_setu(p, "DLSSG.BackbufferSubrectHeight", oh);
+        p_setu(p, "DLSSG.DepthSubrectWidth", sw);
+        p_setu(p, "DLSSG.DepthSubrectHeight", sh);
+        p_setu(p, "DLSSG.MVecsSubrectWidth", sw);
+        p_setu(p, "DLSSG.MVecsSubrectHeight", sh);
+        p_setp(p, "DLSSG.CmdQueue", NULL);
+        p_setp(p, "DLSSG.CmdAlloc", NULL);
+        p_setp(p, "DLSSG.CreateTimelineSyncObjectsCallback", (void *)fg_cb_create_sync);
+        p_setp(p, "DLSSG.CreateTimelineSyncObjectsCallbackData", (void *)&FG);
+        p_setp(p, "DLSSG.SyncSignalCallback", (void *)fg_cb_sync_signal);
+        p_setp(p, "DLSSG.SyncSignalCallbackData", (void *)&FG);
+        p_setp(p, "DLSSG.SyncWaitCallback", (void *)fg_cb_sync_wait);
+        p_setp(p, "DLSSG.SyncWaitCallbackData", (void *)&FG);
+        p_setp(p, "DLSSG.SyncFlushCallback", (void *)fg_cb_sync_flush);
+        p_setp(p, "DLSSG.SyncFlushCallbackData", (void *)&FG);
+        p_setp(p, "DLSSG.QueueSubmitCallback", (void *)fg_cb_queue_submit);
+        p_setp(p, "DLSSG.QueueSubmitCallbackData", (void *)&FG);
+        p_setp(p, "DLSSG.SyncSignalOnlyCallback", (void *)fg_cb_sync_signal_only);
+        p_setp(p, "DLSSG.SyncSignalOnlyCallbackData", (void *)&FG);
+        p_setp(p, "DLSSG.SyncWaitOnlyCallback", (void *)fg_cb_sync_wait_only);
+        p_setp(p, "DLSSG.SyncWaitOnlyCallbackData", (void *)&FG);
+        NgxResult r = N.create1 ? N.create1(c->device, cb, NGX_FEATURE_FRAMEGENERATION, p, &FG.feat)
+                                : N.create(cb, NGX_FEATURE_FRAMEGENERATION, p, &FG.feat);
+        if (!NGX_OK(r) || !FG.feat) {
+            rt_log("dlssg: feature creation at %ux%u (format %d) failed (%08x): DLSS-G off", ow, oh, (int)fmt, (unsigned)r);
+            FG.failed = 1;
+            vkEndCommandBuffer(cb);
+            return 0;
+        }
+        FG.reset = 1;
+        FG.created_max = (uint32_t)gens;
+        FG.sw = sw, FG.sh = sh;
+        FG.internal_w = sw, FG.internal_h = sh;
+        rt_log("dlssg: DLSS-G feature created at %ux%u (format %d, scene %ux%u, max generated %d)",
+               ow, oh, (int)fmt, sw, sh, gens);
+    }
+
+    if (FG.bb_img[slot] != backbuffer || FG.bb_fmt[slot] != fmt || !FG.bb_view[slot]) {
+        if (FG.bb_view[slot]) vkDestroyImageView(c->device, FG.bb_view[slot], NULL), FG.bb_view[slot] = VK_NULL_HANDLE;
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = backbuffer,
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(c->device, &vi, NULL, &FG.bb_view[slot]) != VK_SUCCESS) {
+            vkEndCommandBuffer(cb);
+            return 0;
+        }
+        FG.bb_img[slot] = backbuffer, FG.bb_fmt[slot] = fmt;
+    }
+
+    // Scene-resolution depth and vectors, the same images DLSS SR samples.
+    // A nearest blit down to 1920x1080 shifted thin texels onto the background.
+    // The shader does not dilate, and it subtracts the jitter, so both flags stay off.
+    // Scale stays 1, the same MV.Scale SR uses for these pixel vectors.
+    FG.internal_w = sw;
+    FG.internal_h = sh;
+
+    NgxResourceVK r_bb = res_image(FG.bb_view[slot], backbuffer, fmt, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+    NgxResourceVK r_out[FG_MAX_GEN];
+    NgxResourceVK r_depth = res_image(D.fg_depth_view, D.fg_depth, D.fg_depth_fmt, sw, sh, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
+    NgxResourceVK r_mvec = res_image(D.fg_mv_view, D.fg_mv, VK_FORMAT_R16G16_SFLOAT, sw, sh, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+
+    int reset = FG.reset || D.fg_reset;
+    // Leave fg_scene_ok set. This runs on the present thread while the next
+    // frame's DLSS evaluate may already have stored a new one.
+    FG.reset = 0, D.fg_reset = 0;
+    int is_hdr = fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || fmt == VK_FORMAT_R16G16B16A16_SFLOAT;
+
+    p_setu(p, "Width", ow);
+    p_setu(p, "Height", oh);
+    p_setu(p, "DLSSG.Width", ow);
+    p_setu(p, "DLSSG.Height", oh);
+    p_setu(p, "DLSSG.InternalWidth", FG.internal_w);
+    p_setu(p, "DLSSG.InternalHeight", FG.internal_h);
+    p_setp(p, "DLSSG.Backbuffer", &r_bb);
+    p_setp(p, "DLSSG.Depth", &r_depth);
+    p_setp(p, "DLSSG.MVecs", &r_mvec);
+    p_setp(p, "DLSSG.HUDLess", &r_bb);
+    p_setp(p, "DLSSG.UI", NULL);
+    p_setp(p, "DLSSG.CmdQueue", NULL);
+    p_setp(p, "DLSSG.CmdAlloc", NULL);
+    p_setp(p, "DLSSG.FenceEvent", NULL);
+    p_setp(p, "DLSSG.CreateTimelineSyncObjectsCallback", (void *)fg_cb_create_sync);
+    p_setp(p, "DLSSG.CreateTimelineSyncObjectsCallbackData", (void *)&FG);
+    p_setp(p, "DLSSG.SyncSignalCallback", (void *)fg_cb_sync_signal);
+    p_setp(p, "DLSSG.SyncSignalCallbackData", (void *)&FG);
+    p_setp(p, "DLSSG.SyncWaitCallback", (void *)fg_cb_sync_wait);
+    p_setp(p, "DLSSG.SyncWaitCallbackData", (void *)&FG);
+    p_setp(p, "DLSSG.SyncFlushCallback", (void *)fg_cb_sync_flush);
+    p_setp(p, "DLSSG.SyncFlushCallbackData", (void *)&FG);
+    p_setp(p, "DLSSG.QueueSubmitCallback", (void *)fg_cb_queue_submit);
+    p_setp(p, "DLSSG.QueueSubmitCallbackData", (void *)&FG);
+    p_setp(p, "DLSSG.SyncSignalOnlyCallback", (void *)fg_cb_sync_signal_only);
+    p_setp(p, "DLSSG.SyncSignalOnlyCallbackData", (void *)&FG);
+    p_setp(p, "DLSSG.SyncWaitOnlyCallback", (void *)fg_cb_sync_wait_only);
+    p_setp(p, "DLSSG.SyncWaitOnlyCallbackData", (void *)&FG);
+    p_seti(p, "DLSSG.DynamicResolution", 0);
+    p_seti(p, "DLSSG.IsRecording", 1);
+    p_seti(p, "DLSSG.EnableInterp", 1);
+    p_setu(p, "DLSSG.MultiFrameCount", (unsigned)gens);
+    p_seti(p, "DLSSG.AutomodeOverrideReset", 0);
+    p_seti(p, "DLSSG.NotRenderingGameFrames", 0);
+    p_seti(p, "DLSSG.DepthInverted", 1);
+    p_seti(p, "DLSSG.CameraMotionIncluded", 1);
+    p_seti(p, "DLSSG.ColorBuffersHDR", is_hdr);
+    p_seti(p, "DLSSG.OrthoProjection", 0);
+    p_seti(p, "DLSSG.MenuDetectionEnabled", 0);   // a still camera is not a menu: the port skips FG itself while the menu is open
+    p_seti(p, "DLSSG.InvertXAxis", 0);
+    p_seti(p, "DLSSG.InvertYAxis", 0);
+    p_setf(p, "DLSSG.JitterOffsetX", D.fg_jx);
+    p_setf(p, "DLSSG.JitterOffsetY", D.fg_jy);
+    p_setf(p, "DLSSG.MvecScaleX", 1.0f);
+    p_setf(p, "DLSSG.MvecScaleY", 1.0f);
+    p_setf(p, "DLSSG.MvecInvalidValue", 0.0f);
+    p_seti(p, "DLSSG.MvecDilated", 0);
+    p_seti(p, "DLSSG.MvecJittered", 0);
+    p_setf(p, "DLSSG.MinRelativeLinearDepthObjectSeparation", 0.001f);
+    p_seti(p, "DLSSG.is_constants_valid", 0);
+
+    // Subrect dimensions for Depth, MVecs and Backbuffer
+    p_setu(p, "DLSSG.DepthSubrectBaseX", 0);
+    p_setu(p, "DLSSG.DepthSubrectBaseY", 0);
+    p_setu(p, "DLSSG.DepthSubrectWidth", sw);
+    p_setu(p, "DLSSG.DepthSubrectHeight", sh);
+    p_setu(p, "DLSSG.MVecsSubrectBaseX", 0);
+    p_setu(p, "DLSSG.MVecsSubrectBaseY", 0);
+    p_setu(p, "DLSSG.MVecsSubrectWidth", sw);
+    p_setu(p, "DLSSG.MVecsSubrectHeight", sh);
+    p_setu(p, "DLSSG.BackbufferSubrectBaseX", 0);
+    p_setu(p, "DLSSG.BackbufferSubrectBaseY", 0);
+    p_setu(p, "DLSSG.BackbufferSubrectWidth", ow);
+    p_setu(p, "DLSSG.BackbufferSubrectHeight", oh);
+    p_setu(p, "DLSSG.HUDLessSubrectBaseX", 0);
+    p_setu(p, "DLSSG.HUDLessSubrectBaseY", 0);
+    p_setu(p, "DLSSG.HUDLessSubrectWidth", ow);
+    p_setu(p, "DLSSG.HUDLessSubrectHeight", oh);
+
+    // Camera matrices & vectors from TotK's scene camera block (rows 0-2 view, 3-6 view-projection, 7-10 projection, 11-13 inv view)
+    int cam_valid = 0;
+    if (D.fg_cam_ok) {
+        const float *cr = D.fg_cam_raw;
+        double vp[16], vp_inv[16], proj[16], proj_inv[16];
+        fg_mat4_from_rows(cr + 12, cr + 16, cr + 20, cr + 24, vp);
+        fg_mat4_from_rows(cr + 28, cr + 32, cr + 36, cr + 40, proj);
+        if (inv4(proj, proj_inv) && inv4(vp, vp_inv)) {
+            cam_valid = 1;
+            fg_mat4_to_float(proj, FG.cam_view_to_clip);
+            fg_mat4_to_float(proj_inv, FG.cam_clip_to_view);
+            double prev_vp[16];
+            if (FG.cam_prev_ok) {
+                for (int i = 0; i < 16; i++) prev_vp[i] = FG.cam_prev_vp[i];
+            } else {
+                memcpy(prev_vp, vp, sizeof vp);
+            }
+            double c2p[16], p2c[16];
+            fg_mat4_mul(prev_vp, vp_inv, c2p);
+            if (!inv4(c2p, p2c)) memcpy(p2c, c2p, sizeof p2c);
+            fg_mat4_to_float(c2p, FG.cam_clip_to_prev_clip);
+            fg_mat4_to_float(p2c, FG.cam_prev_clip_to_clip);
+            for (int i = 0; i < 16; i++) FG.cam_prev_vp[i] = (float)vp[i];
+            FG.cam_prev_ok = 1;
+            p_setp(p, "DLSSG.CameraViewToClip", FG.cam_view_to_clip);
+            p_setp(p, "DLSSG.ClipToCameraView", FG.cam_clip_to_view);
+            p_setp(p, "DLSSG.ClipToPrevClip", FG.cam_clip_to_prev_clip);
+            p_setp(p, "DLSSG.PrevClipToClip", FG.cam_prev_clip_to_clip);
+            float sx = fabsf(cr[28]), sy = fabsf(cr[33]);
+            float fov = sy > 1e-4f ? 2.0f * atanf(1.0f / sy) : 1.0f;
+            float aspect = sx > 1e-4f && sy > 1e-4f ? sy / sx : (float)ow / (float)oh;
+            p_setf(p, "DLSSG.CameraFOV", fov);
+            p_setf(p, "DLSSG.CameraAspectRatio", aspect);
+            p_setf(p, "DLSSG.CameraNear", 0.1f);
+            p_setf(p, "DLSSG.CameraFar", fg_camera_far(cr));
+            p_setf(p, "DLSSG.CameraPinholeOffsetX", 0.0f);
+            p_setf(p, "DLSSG.CameraPinholeOffsetY", 0.0f);
+            // World-space camera position from inverse view matrix (rows 11..13, column 3: cr[47], cr[51], cr[55])
+            p_setf(p, "DLSSG.CameraPosX", cr[47]);
+            p_setf(p, "DLSSG.CameraPosY", cr[51]);
+            p_setf(p, "DLSSG.CameraPosZ", cr[55]);
+            // View matrix rows 0..2: right, up, -forward
+            p_setf(p, "DLSSG.CameraRightX", cr[0]);
+            p_setf(p, "DLSSG.CameraRightY", cr[1]);
+            p_setf(p, "DLSSG.CameraRightZ", cr[2]);
+            p_setf(p, "DLSSG.CameraUpX", cr[4]);
+            p_setf(p, "DLSSG.CameraUpY", cr[5]);
+            p_setf(p, "DLSSG.CameraUpZ", cr[6]);
+            p_setf(p, "DLSSG.CameraFwdX", -cr[8]);
+            p_setf(p, "DLSSG.CameraFwdY", -cr[9]);
+            p_setf(p, "DLSSG.CameraFwdZ", -cr[10]);
+        }
+    }
+    if (!cam_valid) {
+        static const float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        memcpy(FG.cam_view_to_clip, ident, sizeof ident);
+        memcpy(FG.cam_clip_to_view, ident, sizeof ident);
+        memcpy(FG.cam_clip_to_prev_clip, ident, sizeof ident);
+        memcpy(FG.cam_prev_clip_to_clip, ident, sizeof ident);
+        p_setp(p, "DLSSG.CameraViewToClip", FG.cam_view_to_clip);
+        p_setp(p, "DLSSG.ClipToCameraView", FG.cam_clip_to_view);
+        p_setp(p, "DLSSG.ClipToPrevClip", FG.cam_clip_to_prev_clip);
+        p_setp(p, "DLSSG.PrevClipToClip", FG.cam_prev_clip_to_clip);
+        p_setf(p, "DLSSG.CameraFOV", 1.0f);
+        p_setf(p, "DLSSG.CameraAspectRatio", (float)ow / (float)oh);
+        p_setf(p, "DLSSG.CameraNear", 0.1f);
+        p_setf(p, "DLSSG.CameraFar", 10000.0f);
+        p_setf(p, "DLSSG.CameraPinholeOffsetX", 0.0f);
+        p_setf(p, "DLSSG.CameraPinholeOffsetY", 0.0f);
+        p_setf(p, "DLSSG.CameraPosX", 0.0f);
+        p_setf(p, "DLSSG.CameraPosY", 0.0f);
+        p_setf(p, "DLSSG.CameraPosZ", 0.0f);
+        p_setf(p, "DLSSG.CameraRightX", 1.0f);
+        p_setf(p, "DLSSG.CameraRightY", 0.0f);
+        p_setf(p, "DLSSG.CameraRightZ", 0.0f);
+        p_setf(p, "DLSSG.CameraUpX", 0.0f);
+        p_setf(p, "DLSSG.CameraUpY", 1.0f);
+        p_setf(p, "DLSSG.CameraUpZ", 0.0f);
+        p_setf(p, "DLSSG.CameraFwdX", 0.0f);
+        p_setf(p, "DLSSG.CameraFwdY", 0.0f);
+        p_setf(p, "DLSSG.CameraFwdZ", 1.0f);
+    }
+
+    int produced = 0;
+    NgxResult r = 0;
+    int ready = 0;
+    for (int g = 0; g < gens; g++) {
+        r_out[g] = res_image(FG.out_view[slot][g], FG.out[slot][g], fmt, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+        p_setp(p, "DLSSG.OutputInterpolated", &r_out[g]);
+        p_setu(p, "DLSSG.MultiFrameIndex", (unsigned)(g + 1));
+        p_seti(p, "DLSSG.Reset", g == 0 ? reset : 0);
+        r = N.evaluate(cb, FG.feat, p, NULL);
+        // Older DLSS-G libraries publish DLSSG.EvaluateIsReady; newer ones publish DLSSG.OutputDisableInterpolation
+        // instead. Take the first name that is there. This code must not write EvaluateIsReady itself: every later
+        // read then returns that value.
+        ready = 0;
+        int got_ready = p_geti(p, "DLSSG.EvaluateIsReady", &ready);
+        int disable = 0;
+        int got_disable = p_geti(p, "DLSSG.OutputDisableInterpolation", &disable);
+        if (!got_ready)
+            ready = got_disable ? disable == 0 : 1;
+        if (!NGX_OK(r) || !ready) break;
+        full_barrier(cb);
+        // fg_sky_stamp(cb, slot, g, ow, oh);   // test: sky stamp off, flicker triage
+        out_interps[produced++] = FG.out[slot][g];
+        FG.ready_count++;
+        if (g + 1 < gens) full_barrier(cb);
+    }
+    full_barrier(cb);
+    vkEndCommandBuffer(cb);
+
+    VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi};
+    vk_queue_lock();
+    VkResult vr = vkQueueSubmit2(c->gfx_queue, 1, &si, FG.fence[slot]);
+    vk_queue_unlock();
+    if (vr != VK_SUCCESS) {
+        vk_device_fault_report(vr);
+        rt_log("dlssg: vkQueueSubmit2 failed (%d)", (int)vr);
+        return 0;
+    }
+    if (!produced && !NGX_OK(r)) {
+        static int err_count = 0;
+        if (err_count++ < 8) rt_log("dlssg: EvaluateFeature returned %08x (ready=%d)", (unsigned)r, ready);
+        return 0;
+    }
+    FG.evals++;
+    if (FG.evals == 1 || FG.evals == 120 || FG.evals % 1800 == 0)
+        rt_log("dlssg: %llu evaluations, %llu interpolated frames ready (%ux%u, scene %ux%u, %llu missed scene, %llu presents without a new scene, x%d)",
+               (unsigned long long)FG.evals, (unsigned long long)FG.ready_count, ow, oh, sw, sh,
+               (unsigned long long)FG.missed_scene, (unsigned long long)FG.stale, gens + 1);
+    return produced;
 }
 
