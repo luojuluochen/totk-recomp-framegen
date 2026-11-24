@@ -7,6 +7,78 @@
 >
 > The game is built from your files on your machine, so the result contains the game. It is for your own use. Do not share it.
 
+## This fork: frame-rate work
+
+This fork (`luojuluochen/totk-pc-recomp`, `main`) is a derivative of upstream TotK Recomp whose changes aim at the frame
+rate on high-refresh displays: NVIDIA DLSS Frame Generation on top of the current main branch, the stability fixes the
+unmerged draft needed to run for hours, and a frame limit that the frame generator cannot overrun. The frame generation
+integration comes from the draft in upstream issue #1069 (`al4xdev`, MIT); the fixes and the overlay change are ours.
+
+### Frame-rate changes
+
+1. **DLSS Frame Generation (DLSS-G)**, `dlss_fg` and `dlss_fg_x` (2 to 6 pictures for each frame the game draws), for
+   RTX 40 series and newer with `nvngx_dlssg.dll` next to `totk.exe`. It runs with the DLSS scene upscaler; DLSS-G is
+   off while the port's own FSR 3 generator (`frame_gen`) is on, and once the game is played the multiplier can be
+   changed in the menu (F1) or in `totk.ini`.
+2. **The feature is rebuilt when the internal scene size changes.** The NGX feature keeps the internal render size it
+   was created with. Dynamic resolution or a teleport changed the render size while the feature kept the old one, and
+   the game ended with `VK_ERROR_DEVICE_LOST` (`vk: device fault address 0: write invalid at 0`) within minutes; now a
+   size change releases the feature and creates it again at the new size.
+3. **Generated images are released only after the present thread is done with them.** A multiplier or swapchain change
+   recreated the generated images while the present thread could still be showing the previous ones; the release now
+   waits for the present thread (`vk_present_drain`), which removed the second kind of device-lost crash.
+4. **The frame limit is divided by the multiplier** (`runtime/frame_rate.c`). `fps_limit` counts the pictures shown, so
+   the game draws `fps_limit / dlss_fg_x` and the generated pictures fill the rest: 4x on a 240 Hz display draws 60 and
+   shows 240. The draft divided by the pictures of the last present instead, so every frame without a generated picture
+   lifted the limit back to the full rate and the generator over-produced.
+5. **The full performance overlay shows the frame-rate line too.** The first F10 press shows the drawn rate and, with
+   frame generation, the pictures shown a second; the second press (the full panel) now shows the same line, so the
+   drawn rate is not lost when the panel is open.
+6. **Settings measured on an RTX 5070 Ti and a Ryzen 7 9700X with a 240 Hz 4K display**, with this fork:
+
+   ```ini
+   [display]
+   scene_upscaler = dlss
+   dlss = quality          # 2560x1440 -> 4K
+   dlss_fg = 1
+   dlss_fg_x = 3           # 80 drawn / 240 shown
+   dynamic_res = 0
+
+   [frame rate]
+   fps_limit = display
+   sync_ahead = 1
+   replay_workers = 4
+   async_preempt = 2
+   ```
+
+   About 75-80 drawn (220-240 shown) in the lighter areas and 50-60 drawn in heavy ones. `replay_workers = 6` and
+   `frame_queue = 1` measured lower frame rates here; `dlaa_objmv = 0` and lower shadow settings are the remaining
+   CPU/GPU levers (see "Known issue" below for what they cost in picture quality).
+
+### Known issue: whole-picture flicker with frame generation
+
+With `dlss_fg = 1`, in some high-contrast areas (around Lookout Landing and the fort, for example) the whole picture,
+the HUD included, flickers; the amplitude grows with `dlss_fg_x`. It is easiest to see standing still, and moving
+masks it. Turning frame generation off removes it; turning the scene upscaler off removes it as well.
+
+What we could narrow down: frame generation interpolates between two real frames. In those areas per-frame exposure and
+tonemapping changes and semi-transparent effects (fog, particles, banners) make consecutive frames differ globally, and
+the current path interpolates the HUD as if it were scene (the final picture is given to NGX as `DLSSG.HUDLess`). The
+interpolated picture therefore differs from the real one and alternates with it at the display rate.
+
+Tried, none removed the flicker without a large frame-rate loss: a HUD-less capture with a UI composite shader (kept on
+an unmerged branch), NGX menu detection off, fixed exposure, the sky stamp, per-object motion vectors, jitter off, and 2x
+to 6x multipliers. The draft's own "frame pacing" issue is a different problem: it is about when the generated pictures
+are shown, not about what they contain. Use 2x to make the flicker less noticeable, or turn frame generation off in
+those areas.
+
+### 中文说明
+
+这个 fork 基于上游 TotK Recomp，主要解决高刷新率下的帧率问题：把未合并的 DLSS 帧生成草案移植到最新 main，并修复了它
+跑几分钟就会 `VK_ERROR_DEVICE_LOST` 的两处问题（场景尺寸变化时重建 NGX 特征、释放生成图前排空呈现线程），同时让帧上限
+按倍率计算、完整性能面板也显示绘制/显示帧率。已知问题是部分高对比区域（如监视堡垒周边）开启帧生成后整屏闪烁，倍率越高
+越明显，原因和已尝试的修法见上面的 "Known issue"。
+
 ## Status
 
 Early development. The game is playable on Windows and Linux; visual bugs and crashes are still expected.
