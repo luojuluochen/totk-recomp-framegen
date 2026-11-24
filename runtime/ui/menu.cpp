@@ -1685,7 +1685,7 @@ static void perf_tick(uint64_t now, const MenuTarget *t) {
         g_perf_mode = m;
     }
     if (g_perf_mode) shown_tick(now);
-    if (g_perf_mode != 1) return;
+    if (!g_perf_mode) return;   // the fps line is kept in full mode too: the panel shows it above its tables
     uint64_t d = now - g_perf_last_ns;
     if (!g_perf_last_ns || d > 2000000000ull) {   // first frame, or a stall the window should not average in
         g_perf_win_ns = g_perf_max_ns = 0;
@@ -1834,6 +1834,7 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
         snprintf(ver, sizeof ver, ver_fmt, rt_port_version, game);
     }
     ImGui::TextDisabled("%s", ver);
+    if (g_perf_text[0]) ImGui::TextUnformatted(g_perf_text);   // the fps overlay's line: drawn, and the pictures shown with frame generation
     if (ImGui::BeginTable("##perft", 4, ImGuiTableFlags_SizingFixedFit)) {
         static const UiTextId labels[] = {UI_MENU_OV_GPU, UI_MENU_OV_VRAM, UI_MENU_OV_CPU, UI_MENU_OV_RAM,
                                           UI_MENU_OV_FPS_LABEL, UI_MENU_OV_FRAME_LABEL};
