@@ -130,6 +130,9 @@ Adjust these to the hardware; they are in the menu (F1, the Screen tab) or in to
    while playing in such an area, or use dlss_fg_x = 2, which makes it much less noticeable. Turning the scene upscaler
    off also stops it, but that also disables DLSS-G, which needs the upscaler.
 
+This was also reproduced on the 0.4.0 baseline with the unmodified draft commit (feat/dlss-fg, 2398554): the flicker
+is the same there, so it is the draft's own behaviour and not something the 0.5.0 work introduced.
+
 A video of the effect (Simplified Chinese, Bilibili): https://www.bilibili.com/video/BV1yh1AzmEbU/ — the flicker is
 shown at 02:36.
 
