@@ -57,7 +57,7 @@ integration comes from the draft in upstream issue #1069 (al4xdev, MIT); the fix
 
    About 75-80 drawn (220-240 shown) in the lighter areas and 50-60 drawn in heavy ones. replay_workers = 6 and
    frame_queue = 1 measured lower frame rates here; dlaa_objmv = 0 and lower shadow settings are the remaining
-   CPU/GPU levers (see "Known issue" below for what they cost in picture quality).
+   CPU/GPU levers (they trade picture quality for CPU/GPU time).
 
 ### Complete settings used on the test machine
 
@@ -111,37 +111,15 @@ Adjust these to the hardware; they are in the menu (F1, the Screen tab) or in to
   less and look close at normal viewing distances.
 - **grass_range** (50 to 400) and **aniso** (game, 2 to 16) add GPU work over large parts of the world.
 - **dlss_fg_x** does not change the drawn frame rate target directly; it divides the frame limit (240 / x) and adds
-  generated pictures on top. A lower multiplier frees the game to draw faster and makes the flicker (below) less
-  noticeable.
+  generated pictures on top. A lower multiplier frees the game to draw faster.
 - A GPU with less headroom than an RTX 5070 Ti should start from dlss = balanced or performance, shadow_scale = 1 and
   shadow_range = 100, and raise them until the frame times stop fitting.
-
-### Known issue: whole-picture flicker with frame generation
-
-1. **Symptom.** With dlss_fg on, the whole picture flickers (the HUD and the game's own image together) in some areas.
-   The amplitude grows with dlss_fg_x: 2x is mild, 4x and 6x are clearly visible.
-2. **Where and how to reproduce.** Just outside the north gate of Lookout Landing, on the bank of the Hylia River
-   (west of Mabe Prairie), at about X -0231, Z 0020 (12 m above sea level): the spot by the gate's wooden palisade and
-   the lone tree beside it, with the fort wall, the banner and the tree in the frame (the map view at X -0224, Z 0019
-   marks the same place). Stand still with the camera still and watch the picture; it flickers within a second or two.
-   The same view with frame generation off (menu, F1) is steady. High-contrast spots elsewhere in the world show it
-   too; most of the map does not.
-3. **Workarounds.** Keep the camera moving (the motion masks the flicker), turn frame generation off in the menu (F1)
-   while playing in such an area, or use dlss_fg_x = 2, which makes it much less noticeable. Turning the scene upscaler
-   off also stops it, but that also disables DLSS-G, which needs the upscaler.
-
-This was also reproduced on the 0.4.0 baseline with the unmodified draft commit (feat/dlss-fg, 2398554): the flicker
-is the same there, so it is the draft's own behaviour and not something the 0.5.0 work introduced.
-
-A video of the effect (Simplified Chinese, Bilibili): https://www.bilibili.com/video/BV1yh1AzmEbU/ — the flicker is
-shown at 02:36.
 
 ### 中文说明
 
 这个 fork 基于上游 TotK Recomp，主要解决高刷新率下的帧率问题：把未合并的 DLSS 帧生成草案移植到最新 main，并修复了它
 跑几分钟就会 VK_ERROR_DEVICE_LOST 的两处问题（场景尺寸变化时重建 NGX 特征、释放生成图前排空呈现线程），同时让帧上限
-按倍率计算、完整性能面板也显示绘制/显示帧率。已知问题是部分高对比区域（如监视堡垒周边）开启帧生成后整屏闪烁，倍率越高
-越明显，原因和已尝试的修法见上面的 "Known issue"。
+按倍率计算、完整性能面板也显示绘制/显示帧率。
 
 ## Status
 
