@@ -164,6 +164,18 @@ static void unlock(void) {
     plat_rmutex_unlock(&tex_lock);
 }
 
+// A texel read or write waits for its staging copy in the upload batch (vk_upload_flush(1)); not with the texture
+// lock held. The wait would hold up every texture registration (nvnTextureInitialize) and draw record that takes the
+// lock, and the batch it waits for may in turn wait on one of those (the hang seen in play: the register thread
+// spinning on tex_lock, the upload fence never done). Same release as entry_of's chunk settle, and for the same
+// reason: the callers touch no entry after the wait, only their own staging buffer, which this thread owns.
+static void tex_wait_unlocked(int wait) {
+    int d = tex_depth;
+    for (int i = 0; i < d; i++) unlock();
+    vk_upload_flush(wait);
+    for (int i = 0; i < d; i++) lock();
+}
+
 static uint32_t umax(uint32_t a, uint32_t b) { return a > b ? a : b; }
 static uint32_t mip(uint32_t v, unsigned lv) { return umax(v >> lv, 1); }
 
@@ -1950,6 +1962,7 @@ typedef struct {
     size_t slice, ib;   // ib: bytes per texel of an expanded RGB image, 0 when the image holds the storage layout
     size_t bytes;       // the size of the staging buffer: slice times the depth of the region
     uint32_t w;
+    uint32_t fmt;       // the entry's format at plan time (the entry may go once the lock is released for the wait)
     VkImageAspectFlags aspect;
 } TexRead;
 
@@ -1968,6 +1981,7 @@ static int texels_read_plan(Tex *e, const Region *g, const NVNcopyRegion *r, Tex
     if (g->level >= e->pub.levels) return 0;
     uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height;
     t->w = w;
+    t->fmt = e->t.d.format;
     t->ib = e->f.expand_rgb ? (size_t)g->bpb / 3 * 4 : 0;
     t->slice = t->ib ? (size_t)w * h * t->ib : g->wb * g->hb;
     t->bytes = t->slice * (size_t)g->nz;
@@ -2003,21 +2017,21 @@ static int texels_read_record(Tex *e, const Region *g, const NVNcopyRegion *r, T
 }
 
 // The rows of a finished read into caller memory; the staging buffer stays.
-static void texels_read_rows(const Tex *e, const Region *g, const TexRead *t, uint8_t *mem) {
+static void texels_read_rows(const Region *g, const TexRead *t, uint8_t *mem) {
     VkCtx *c = vk_ctx();
     vmaInvalidateAllocation(c->vma, t->sa, 0, VK_WHOLE_SIZE);
     for (int z = 0; z < g->nz; z++) {
         const uint8_t *s = t->stg + t->slice * (size_t)z;
         uint8_t *m = mem + (size_t)z * g->img;
         for (size_t y = 0; y < g->hb; y++) {
-            if (t->ib) shrink_rgb(e->t.d.format, s + y * t->w * t->ib, m + y * g->row, t->w);
+            if (t->ib) shrink_rgb(t->fmt, s + y * t->w * t->ib, m + y * g->row, t->w);
             else memcpy(m + y * g->row, s + y * g->wb, g->wb);
         }
     }
 }
 
-static void texels_read_take(const Tex *e, const Region *g, const TexRead *t, uint8_t *mem) {
-    texels_read_rows(e, g, t, mem);
+static void texels_read_take(const Region *g, const TexRead *t, uint8_t *mem) {
+    texels_read_rows(g, t, mem);
     vmaDestroyBuffer(vk_ctx()->vma, t->sb, t->sa);
 }
 
@@ -2029,8 +2043,8 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     if (!write) {
         TexRead t;
         if (!texels_read_record(e, g, r, &t)) return 0;
-        vk_upload_flush(1);
-        texels_read_take(e, g, &t, mem);
+        tex_wait_unlocked(1);
+        texels_read_take(g, &t, mem);
         return 1;
     }
     if (!read_aspect(e, &aspect)) {
@@ -2093,7 +2107,7 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
                                 (unsigned long long)e->pub.addr);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     vk_upload_end();
-    vk_upload_flush(1);
+    tex_wait_unlocked(1);
     free(rg);
     vmaDestroyBuffer(c->vma, sb, sa);
     return 1;
@@ -2408,8 +2422,8 @@ static void write_back_n(Tex **v, int n) {
             buf = rt_realloc_wait(NULL, bytes, "vk: texture write-back buffer");
         }
         if (!buf) rt_fatal("vk: out of memory for a texture write-back");
-        if (q->snap) texels_read_rows(q->e, &q->ep.g, &q->ep.t, buf);
-        else texels_read_take(q->e, &q->ep.g, &q->ep.t, buf);
+        if (q->snap) texels_read_rows(&q->ep.g, &q->ep.t, buf);
+        else texels_read_take(&q->ep.g, &q->ep.t, buf);
         if (q->has_chk) {
             vmaInvalidateAllocation(vk_ctx()->vma, q->chk.sa, 0, VK_WHOLE_SIZE);
             eager_compared++;
