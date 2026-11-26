@@ -12,6 +12,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "nvn_api.h"   // gfx_counters.frames, the census window
 #include "vk.h"
 
 typedef struct {
@@ -206,3 +207,76 @@ void vk_rt_init(void) {
 }
 
 int vk_rt_ready(void) { return rt_up; }
+
+// ---- geometry census (TOTK_RT=geom)
+// Counts what the scene's indexed draws offer a BVH: how many, how many triangles, which vertex-shader banks they read
+// (an object's own place c7 or bones c5 against terrain that has neither), the position attribute's NVN format, offset
+// and stream, and whether the draw's own vertex and index buffers carry device addresses. Nothing here touches the GPU.
+static int geom_on = -1;
+
+int vk_rt_geom_on(void) {
+    if (geom_on < 0) {
+        VkCtx *c = vk_ctx();
+        const char *v = cfg_get("TOTK_RT");
+        geom_on = c && c->has_accel_struct && v && (!strcmp(v, "geom") || !strcmp(v, "1"));
+    }
+    return geom_on;
+}
+
+static struct {
+    uint64_t draws, tris, skinned, place, neither, buildable;
+    uint64_t itype[3];
+    uint64_t afmt[256], aoff[256], astr[256];
+    uint64_t last_frame;
+} G;
+
+static struct { VkBuffer b; VkDeviceAddress a; int ok; } ac[1024];
+
+static VkDeviceAddress buf_addr(VkBuffer b) {
+    if (!b) return 0;
+    unsigned h = (unsigned)((((uintptr_t)b >> 4) * 2654435761u) >> 10) & 1023;
+    if (ac[h].b == b) return ac[h].ok ? ac[h].a : 0;
+    VkBufferDeviceAddressInfo i = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b};
+    VkDeviceAddress a = F.buffer_address(vk_ctx()->device, &i);
+    ac[h].b = b, ac[h].a = a, ac[h].ok = a != 0;
+    return a;
+}
+
+void vk_rt_geom_draw(const VkRtGeomDraw *d) {
+    if (!geom_on || !d->scene) return;
+    uint32_t fmt = d->attr[0] & 0xffu, off = (d->attr[0] >> 8) & 0x7ffffu, str = (d->attr[0] >> 27) & 0x1fu;
+    VkBuffer pb = str < 16 ? d->vb[str] : VK_NULL_HANDLE;
+    G.draws++;
+    G.tris += d->count / 3;
+    G.itype[d->itype & 3]++;
+    G.afmt[fmt]++, G.aoff[fmt] = off, G.astr[fmt] = str;
+    if (d->c5) G.skinned++;
+    if (d->c7) G.place++;
+    if (!d->c5 && !d->c7) G.neither++;
+    if (buf_addr(pb) && buf_addr(d->ib)) G.buildable++;
+    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (!G.last_frame) G.last_frame = frame;
+    if (frame - G.last_frame < 300) return;
+    uint64_t n = G.draws;
+    char pos[200] = "";
+    for (int k = 0; k < 3; k++) {   // the top three position formats, they are consumed
+        int best = -1;
+        for (int f = 0; f < 256; f++)
+            if (G.afmt[f] && (best < 0 || G.afmt[f] > G.afmt[best])) best = f;
+        if (best < 0) break;
+        char t[72];
+        snprintf(t, sizeof t, "%s0x%02x %.0f%% (offset %llu, stream %llu)", k ? ", " : "", best,
+                 100.0 * (double)G.afmt[best] / (double)n, (unsigned long long)G.aoff[best],
+                 (unsigned long long)G.astr[best]);
+        strncat(pos, t, sizeof pos - strlen(pos) - 1);
+        G.afmt[best] = 0;
+    }
+    rt_log("rt: geom: %llu frames: %llu scene draws, %.1f M tris; c5 skinned %.1f%%, c7 place %.1f%%, neither %.1f%%; "
+           "vertex+index buffers with device addresses %.1f%%; index u8 %llu u16 %llu u32 %llu; position attr %s",
+           (unsigned long long)(frame - G.last_frame), (unsigned long long)n, (double)G.tris / 1e6,
+           100.0 * (double)G.skinned / (double)n, 100.0 * (double)G.place / (double)n, 100.0 * (double)G.neither / (double)n,
+           100.0 * (double)G.buildable / (double)n, (unsigned long long)G.itype[0], (unsigned long long)G.itype[1],
+           (unsigned long long)G.itype[2], pos);
+    memset(&G, 0, sizeof G);
+    G.last_frame = frame;
+}

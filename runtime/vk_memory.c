@@ -108,6 +108,9 @@ static VkBufferUsageFlags pool_usage(const VkCtx *c) {
     if (c->has_transform_feedback)
         u |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
     if (c->has_conditional_rendering) u |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+    // TOTK_RT: the BVH reads the draws' vertex and index data where it already is (vk_rt.c geometry capture). The flag
+    // costs nothing when the player's switch is off: it is only set when the acceleration structures are enabled.
+    if (c->has_accel_struct) u |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     return u;
 }
 

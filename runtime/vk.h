@@ -621,6 +621,21 @@ void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem
 void vk_rt_init(void);   // after the device is up: load the entry points, log what the GPU reports, run the probe
 int  vk_rt_ready(void);  // 1: VK_KHR_acceleration_structure + VK_KHR_ray_query enabled, entry points loaded
 
+// Geometry capture, first as a census (TOTK_RT=geom): one indexed scene draw as vk_exec_draw.c records it. The counts
+// say how much of the scene's geometry the port can hand a BVH, and whether the draws' own buffers carry the device
+// addresses a bottom level structure needs (vk_memory.c pool_usage adds the usage flag when RT is on).
+typedef struct {
+    uint32_t prim, count;      // NVN topology, index count
+    int32_t itype, base_vertex;
+    VkBuffer ib; VkDeviceSize ib_off;
+    VkBuffer vb[16]; VkDeviceSize vb_off[16], vb_stride[16], vb_size[16];
+    uint32_t attr[16];         // NVNvertexAttribState: fmt:8, offset:19, stream:5
+    int scene;                 // the scene G-buffer pass (vk_dlaa_draw's test)
+    int c5, c7;                // the vertex shader reads an object's bones (c5) and place (c7)
+} VkRtGeomDraw;
+int  vk_rt_geom_on(void);   // TOTK_RT=geom (or 1): the census runs
+void vk_rt_geom_draw(const VkRtGeomDraw *d);
+
 // ---- pipelines (vk_pipeline.c)
 // Binding model (comment block at the top of vk_pipeline.c): one descriptor set, set 0, per pipeline. Binding 0 is
 // Ryujinx's support buffer (a uniform buffer every stage shares); the vertex stage keeps its own bindings, the fragment
