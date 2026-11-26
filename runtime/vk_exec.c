@@ -1053,8 +1053,10 @@ static void run_job(VkExec *ex) {
         j.sun.img = ui, j.sun.image = ui ? ui->image : VK_NULL_HANDLE;
         if (si && di) {
             j.scene.img = si, j.scene.image = si->image, j.depth.img = di, j.depth.image = di->image;
-            vk_contact_exec(ex, &j);
+            if (vk_contact_strength()) vk_contact_exec(ex, &j);
         }
+        // The scene's draws are all recorded before this point: build the frame's TLAS here (vk_rt.c).
+        vk_rt_shadow_exec(ex, &j);
     }
     __atomic_store_n(&job_turn, turn + 1, __ATOMIC_RELEASE);
     ex->dirty = VK_EXEC_DIRTY_ALL;

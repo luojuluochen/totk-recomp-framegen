@@ -234,7 +234,9 @@ static int is_composite(const VkExec *ex) {
 }
 
 int vk_contact_plan(const VkExec *ex, int pass, VkExecJob *j) {
-    if (!vk_contact_strength() && !ao_strength()) return 0;
+    // The composite point is also where the scene's BVH is built (vk_rt.c vk_rt_shadow_exec): plan the job for it too
+    // when ray tracing is on, even with the contact shadows themselves off.
+    if (!vk_contact_strength() && !ao_strength() && !vk_rt_shadows_on()) return 0;
     if (pass) {
         const VkExecTarget *scene, *depth;
         // The camera block: c4 of the fragment stage, 0x940 bytes. The composite binds it only after its pass begins, so

@@ -632,9 +632,20 @@ typedef struct {
     uint32_t attr[16];         // NVNvertexAttribState: fmt:8, offset:19, stream:5
     int scene;                 // the scene G-buffer pass (vk_dlaa_draw's test)
     int c5, c7;                // the vertex shader reads an object's bones (c5) and place (c7)
+    VkCommandBuffer cb;        // the replay's command buffer: a new BLAS's build is recorded into it
+    uint64_t fence;            // the submission's timeline value (scratch buffers are freed after it)
+    uint64_t c7_addr;          // guest address of the object's 3x4 place (bank c7's block), 0: none
+    const GfxShader *vs;       // the draw's vertex shader (its resource list says whether c7 is read)
 } VkRtGeomDraw;
 int  vk_rt_geom_on(void);   // TOTK_RT=geom (or 1): the census runs
 void vk_rt_geom_draw(const VkRtGeomDraw *d);
+// Scene BVH (TOTK_RT=bvh or 1): a BLAS per unique piece of geometry, a TLAS rebuilt at the scene's composite (the same
+// point the contact shadows use, vk_contact.c). The TLAS is what the ray-query passes trace against (vk_rt_shadow.c).
+struct VkExec;      // vk_exec.h (included after this header by the replay and vk_rt.c)
+struct VkExecJob;
+int  vk_rt_shadows_on(void);
+void vk_rt_shadow_exec(struct VkExec *ex, const struct VkExecJob *j);
+void vk_rt_shutdown(void);  // at device teardown, after vkDeviceWaitIdle
 
 // ---- pipelines (vk_pipeline.c)
 // Binding model (comment block at the top of vk_pipeline.c): one descriptor set, set 0, per pipeline. Binding 0 is

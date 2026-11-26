@@ -4436,7 +4436,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     ex->recorded++;
     if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) {
         mvobj_draw(ex, d, sp.buffer, sp.offset);
-        if (vk_rt_geom_on()) {   // TOTK_RT=geom: what this draw offers a BVH (vk_rt.c)
+        if (vk_rt_geom_on() || vk_rt_shadows_on()) {   // TOTK_RT: what this draw offers a BVH (vk_rt.c)
             VkRtGeomDraw g;
             memset(&g, 0, sizeof g);
             g.prim = (uint32_t)d->prim, g.count = (uint32_t)d->count, g.itype = d->itype, g.base_vertex = d->base_vertex;
@@ -4446,6 +4446,9 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
             memcpy(g.attr, ex->pipe.vattr, sizeof g.attr);
             g.c5 = ex->ubo[NVN_STAGE_VS][2].addr != 0;   // bank c5
             g.c7 = ex->ubo[NVN_STAGE_VS][4].addr != 0;   // bank c7
+            g.cb = ex->cb, g.fence = ex->fence;
+            g.c7_addr = ex->ubo[NVN_STAGE_VS][4].addr;
+            g.vs = D->B.st.vs;
             const VkExecTarget *z = &ex->depth;
             g.scene = z->image && z->width >= DLAA_SCENE_MIN_W && z->format == VK_FORMAT_D32_SFLOAT &&
                       D->B.st.samples <= 1 && D->B.st.ds.dt && D->B.st.ds.dw;
