@@ -38,7 +38,8 @@ typedef struct VkCtx {
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
         has_calibrated,                     // VK_KHR/EXT_calibrated_timestamps (GPU idle split in the perf line)
         has_hdr_metadata,                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
-        has_nv_reflex;                      // VK_NV_low_latency2 (NVIDIA Reflex Low Latency)
+        has_nv_reflex,                      // VK_NV_low_latency2 (NVIDIA Reflex Low Latency)
+        has_accel_struct, has_ray_query;    // VK_KHR_acceleration_structure / ray_query (TOTK_RT=1, vk_rt.c)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -612,6 +613,13 @@ void vk_present_drain(void);               // returns once every queued present 
 int vk_replay_async(void);                 // TOTK_REPLAY_ASYNC (default 0): submissions replay on the replay thread
 void vk_program_release(const prog_t *p);  // GfxBackend.program_release: vk_pipeline.c; weak no-op in vk_backend.c
 void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem_shutdown, vk_shutdown in that order
+
+// ---- ray tracing (vk_rt.c)
+// Off by default: the extensions and their features are enabled in vk_device.c only when TOTK_RT is set (1, probe,
+// check), so a start without it is exactly as before. TOTK_RT=probe builds a one-triangle BLAS and a one-instance
+// TLAS on the GPU and frees them, to prove the driver path before the real passes exist.
+void vk_rt_init(void);   // after the device is up: load the entry points, log what the GPU reports, run the probe
+int  vk_rt_ready(void);  // 1: VK_KHR_acceleration_structure + VK_KHR_ray_query enabled, entry points loaded
 
 // ---- pipelines (vk_pipeline.c)
 // Binding model (comment block at the top of vk_pipeline.c): one descriptor set, set 0, per pipeline. Binding 0 is

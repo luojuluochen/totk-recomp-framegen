@@ -289,6 +289,8 @@ typedef struct {
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
     VkPhysicalDeviceAddressBindingReportFeaturesEXT abr;
     VkPhysicalDevicePresentIdFeaturesKHR pid;
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as;   // TOTK_RT (vk_rt.c)
+    VkPhysicalDeviceRayQueryFeaturesKHR rq;
 } FeatureChain;
 
 static int create_device(void) {
@@ -377,6 +379,25 @@ static int create_device(void) {
         gpl_link = tail;
         CHAIN(gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
     }
+    // Ray tracing (vk_rt.c): opt in with TOTK_RT=1, probe or check. The extensions and their features are enabled
+    // only when it is set, so a start without TOTK_RT is exactly as before. The feature query below fills the two
+    // structs with what the GPU supports; the same chain then enables it.
+    int rt_want = cfg_bool("TOTK_RT");
+    if (rt_want) {
+        if (has_ext(ep, ne, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+            has_ext(ep, ne, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+            has_ext(ep, ne, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
+            ext[n_ext++] = VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
+            ext[n_ext++] = VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
+            ext[n_ext++] = VK_KHR_RAY_QUERY_EXTENSION_NAME;
+            CHAIN(as, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR);
+            CHAIN(rq, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR);
+            g_vk.has_accel_struct = 1;   // provisional: the feature bits below decide
+        } else {
+            rt_log("rt: %s does not report VK_KHR_acceleration_structure + VK_KHR_ray_query + VK_KHR_deferred_host_operations",
+                   g_vk.props.deviceName);
+        }
+    }
     free(ep);
 
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
@@ -404,6 +425,18 @@ static int create_device(void) {
     else if (!h->geometryShader) miss = "geometryShader";
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
+    if (rt_want) {
+        g_vk.has_accel_struct = c->as.accelerationStructure;
+        g_vk.has_ray_query = c->rq.rayQuery;
+        VkPhysicalDeviceAccelerationStructurePropertiesKHR asp = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2rt = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &asp};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2rt);
+        rt_log("rt: acceleration structures %s, ray query %s; up to %llu geometries, %llu instances, %llu primitives, "
+               "scratch align %u", g_vk.has_accel_struct ? "yes" : "no", g_vk.has_ray_query ? "yes" : "no",
+               (unsigned long long)asp.maxGeometryCount, (unsigned long long)asp.maxInstanceCount,
+               (unsigned long long)asp.maxPrimitiveCount, asp.minAccelerationStructureScratchOffsetAlignment);
+    }
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     // Vulkan 1.3 requires the feature, and the chain goes to vkCreateDevice as the driver filled it, so it is enabled
     // wherever reported; vk_pipeline.c spirv_demote emits OpDemoteToHelperInvocation only when it is.
@@ -511,7 +544,8 @@ int vk_init(void) {
     if (!g_ready) {
         memset(&g_vk, 0, sizeof g_vk);
         if (create_instance() && pick_device() && create_device())
-            g_ready = 1, vk_mem_host_probe(), vk_upload_pools_init(), vk_headroom_start(), vk_dlaa_init(), vk_fg_init();
+            g_ready = 1, vk_mem_host_probe(), vk_upload_pools_init(), vk_headroom_start(), vk_dlaa_init(), vk_fg_init(),
+            vk_rt_init();
         else destroy_all();
     }
     int ok = g_ready;
