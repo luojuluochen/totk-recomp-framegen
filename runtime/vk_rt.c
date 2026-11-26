@@ -14,6 +14,7 @@
 #include "host.h"
 #include "nvn_api.h"   // gfx_counters.frames, the census window
 #include "platform/platform.h"
+#include "rt_shadow_spv.h"
 #include "vk.h"
 #include "vk_exec.h"   // VkExec: the replay's command buffer and fence
 
@@ -424,8 +425,27 @@ static void rt_collect(const VkRtGeomDraw *d) {
     if (maxv > 0xFFFFFFu) maxv = 0xFFFFFFu;
     RtKey k = {.vb = vbase, .ib = ibase, .stride = stride, .count = (uint32_t)d->count, .vkfmt = (uint32_t)vf,
                .itype = (uint32_t)d->itype, .maxv = maxv};
+    // The TLAS is built in view space: the object's place (world) through the scene camera's view matrix (the block's
+    // first 3x4, vk_dlaa.c note_camera). The depth the shader reads reconstructs view-space positions, so the ray query
+    // needs no inverse.
     VkTransformMatrixKHR m;
-    memcpy(&m, (const void *)(uintptr_t)d->c7_addr, sizeof m);
+    float mo[12];
+    // As of the submit, not the replay: the game may already hold the next frame's blocks there (sync_ahead), and a
+    // matrix read one frame ahead of the depth made every shadow edge jump from frame to frame (vk_dlaa.c does the
+    // same for the motion vectors).
+    const float *ms = (const float *)vk_usnap_bytes(d->c7_addr, sizeof mo);
+    memcpy(mo, ms ? ms : (const void *)(uintptr_t)d->c7_addr, sizeof mo);
+    if (d->cam_addr) {
+        const float *v = (const float *)vk_usnap_bytes(d->cam_addr, 256);
+        if (!v) v = (const float *)(uintptr_t)d->cam_addr;
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++)
+                m.matrix[i][j] = v[i * 4 + 0] * mo[j] + v[i * 4 + 1] * mo[4 + j] + v[i * 4 + 2] * mo[8 + j];
+            m.matrix[i][3] = v[i * 4 + 0] * mo[3] + v[i * 4 + 1] * mo[7] + v[i * 4 + 2] * mo[11] + v[i * 4 + 3];
+        }
+    } else {
+        memcpy(&m, mo, sizeof m);
+    }
     plat_rmutex_lock(&rt_lock);
     if (rt_ninst == rt_cinst) {
         uint32_t nc = rt_cinst ? rt_cinst * 2 : 256;
@@ -564,11 +584,137 @@ static int rt_tlas_set_init(RtTlasSet *s) {
     return 1;
 }
 
+// ---- the ray-query shadow pass (runtime/shaders/rt_shadow.comp) ---------------------------------
+static struct {
+    int tried, ok;
+    int strength, debug;
+    uint64_t n;   // dispatches so far, for the stats line
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout layout;
+    VkPipeline pipe;
+    VkSampler samp;
+    PFN_vkCmdPushDescriptorSetKHR push;
+} S;
+
+static int rt_shadow_init(void) {
+    if (S.tried) return S.ok;
+    S.tried = 1;
+    VkCtx *c = vk_ctx();
+    const char *sv = cfg_get("TOTK_RT_SHADOW");
+    // Full strength turns a shadowed pixel black: the composite's colour holds ambient light too, and only the direct
+    // sun may go. 55% reads like the game's own shadows; TOTK_RT_SHADOW=0..100 sets it.
+    S.strength = sv && *sv ? atoi(sv) : 55;
+    if (S.strength <= 0) {
+        rt_log("rt: shadows off (TOTK_RT_SHADOW=0)");
+        return 0;
+    }
+    if (S.strength > 100) S.strength = 100;
+    const char *dv = cfg_get("TOTK_RT_SHADOW_DEBUG");
+    S.debug = dv && *dv && strcmp(dv, "0") ? atoi(dv) : 0;
+    S.push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
+    VkDescriptorSetLayoutBinding b[4] = {
+        {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+    VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                           .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                                           .bindingCount = 4, .pBindings = b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                     .pSetLayouts = &S.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+    VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
+                              .minFilter = VK_FILTER_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                              .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                              .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0};
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                   .codeSize = sizeof rt_shadow_spv, .pCode = rt_shadow_spv};
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (!S.push || vkCreateDescriptorSetLayout(c->device, &dci, NULL, &S.dsl) != VK_SUCCESS ||
+        vkCreatePipelineLayout(c->device, &li, NULL, &S.layout) != VK_SUCCESS ||
+        vkCreateSampler(c->device, &si, NULL, &S.samp) != VK_SUCCESS ||
+        vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS) {
+        rt_log("rt: shadows off: their pipeline could not be created");
+        return 0;
+    }
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
+                                      .layout = S.layout};
+    VkResult r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &S.pipe);
+    vkDestroyShaderModule(c->device, m, NULL);
+    if (r != VK_SUCCESS) {
+        rt_log("rt: shadows off: the compute pipeline failed (%d)", (int)r);
+        return 0;
+    }
+    rt_log("rt: shadows on: one ray toward the sun a pixel, strength %d%%%s", S.strength,
+           S.debug ? " (debug view: the shadow factor in grey)" : "");
+    S.ok = 1;
+    return 1;
+}
+
+static void rt_shadow_record(struct VkExec *ex, const struct VkExecJob *j, VkAccelerationStructureKHR tlas) {
+    if (!rt_shadow_init()) return;
+    VkImageView in = vk_exec_target_view(j->depth.img, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D,
+                                         VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
+    VkImageView out = vk_exec_target_view(j->scene.img, VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_IMAGE_VIEW_TYPE_2D,
+                                          VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
+    VkImageView sun = j->sun.img ? vk_exec_target_view(j->sun.img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_VIEW_TYPE_2D,
+                                                       VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0)
+                                 : VK_NULL_HANDLE;
+    static int logged;
+    if (!logged) {
+        logged = 1;
+        rt_log("rt: shadow dispatch: scene %ux%u, depth view %d, scene view %d, sun view %d; proj %.3f %.3f far %.1f, "
+               "sun %.3f %.3f %.3f", j->scene.width, j->scene.height, in != VK_NULL_HANDLE, out != VK_NULL_HANDLE,
+               sun != VK_NULL_HANDLE, j->pc[0], j->pc[1], j->pc[2], j->pc[4], j->pc[5], j->pc[6]);
+    }
+    if (!in || !out) return;
+    vk_exec_barrier(ex);   // the G-buffer images in GENERAL with their writes visible (as vk_contact.c)
+    VkCommandBuffer cb = ex->cb;
+    float pcv[16];
+    memcpy(pcv, j->pc, sizeof pcv);
+    pcv[3] = (float)S.strength / 100.0f;
+    pcv[12] = (float)S.debug;
+    const char *iv = cfg_get("TOTK_RT_SHADOW_IGNORE_VIS");   // test: darken even where the game's shadow maps shadow
+    pcv[13] = sun && !(iv && *iv && strcmp(iv, "0") != 0) ? 1.0f : 0.0f;
+    VkDescriptorImageInfo ii = {S.samp, in, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo oi = {VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo si = {S.samp, sun ? sun : in, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSetAccelerationStructureKHR asw = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+        .accelerationStructureCount = 1,
+        .pAccelerationStructures = &tlas};
+    VkWriteDescriptorSet w[4] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, .pNext = &asw},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &oi},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 3, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &si}};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.pipe);
+    S.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.layout, 0, 4, w);
+    vkCmdPushConstants(cb, S.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pcv, pcv);
+    vkCmdDispatch(cb, (j->scene.width + 7) / 8, (j->scene.height + 7) / 8, 1);
+    S.n++;
+    vk_texture_storage_written(j->scene.img);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    ex->recorded += 6;
+    vk_exec_draw_new_cb(ex);
+}
+
 // At the scene's composite (the contact shadows' point, vk_exec.c run_job): create the BLASes the draws asked for
 // since the last one, then record the frame's TLAS build into the job's command buffer. Two sets alternate, since the
 // replay may run a frame ahead of the GPU: a set is not written while the other is read.
 void vk_rt_shadow_exec(struct VkExec *ex, const struct VkExecJob *j) {
-    (void)j;
     if (!vk_rt_shadows_on() || !ex || !ex->cb) return;
     plat_rmutex_lock(&rt_lock);
     uint32_t n = rt_ninst;
@@ -639,17 +785,27 @@ void vk_rt_shadow_exec(struct VkExec *ex, const struct VkExecJob *j) {
     VkAccelerationStructureBuildRangeInfoKHR range = {.primitiveCount = m};
     const VkAccelerationStructureBuildRangeInfoKHR *ranges = &range;
     F.build(ex->cb, 1, &bi, &ranges);
+    // The shadow pass reads what was just built: AS write -> compute shader read.
+    VkMemoryBarrier2 ab = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                           .srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR};
+    VkDependencyInfo ad = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &ab};
+    vkCmdPipelineBarrier2(ex->cb, &ad);
+    rt_shadow_record(ex, j, s->tlas);
     rt_stat_inst += m;
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (!rt_stat_last) rt_stat_last = frame;
     if (frame - rt_stat_last >= 300) {
-        rt_log("rt: bvh: %llu frames: %u BLASes (%llu new), %llu instances (%.0f a frame), %.0f KB a TLAS; skipped "
-               "%llu instances, %llu over the %d-build cap",
+        rt_log("rt: bvh: %llu frames: %u BLASes (%llu new), %llu instances (%.0f a frame), %.0f KB a TLAS, %llu shadow "
+               "dispatches; skipped %llu instances, %llu over the %d-build cap",
                (unsigned long long)(frame - rt_stat_last), rt_nbl, (unsigned long long)rt_stat_builds,
                (unsigned long long)rt_stat_inst, (double)rt_stat_inst / (double)(frame - rt_stat_last),
-               (double)s->bytes / 1024.0, (unsigned long long)rt_stat_skip_inst,
+               (double)s->bytes / 1024.0, (unsigned long long)S.n, (unsigned long long)rt_stat_skip_inst,
                (unsigned long long)rt_stat_skip_blas, RT_BUILDS_PER_JOB);
         rt_stat_inst = rt_stat_builds = rt_stat_skip_inst = rt_stat_skip_blas = 0;
+        S.n = 0;
         rt_stat_last = frame;
     }
     rt_set_i = (rt_set_i + 1) % RT_TLAS_SETS;

@@ -635,6 +635,7 @@ typedef struct {
     VkCommandBuffer cb;        // the replay's command buffer: a new BLAS's build is recorded into it
     uint64_t fence;            // the submission's timeline value (scratch buffers are freed after it)
     uint64_t c7_addr;          // guest address of the object's 3x4 place (bank c7's block), 0: none
+    uint64_t cam_addr;         // guest address of the scene camera block (view matrix in its first 3x4), 0: none
     const GfxShader *vs;       // the draw's vertex shader (its resource list says whether c7 is read)
 } VkRtGeomDraw;
 int  vk_rt_geom_on(void);   // TOTK_RT=geom (or 1): the census runs

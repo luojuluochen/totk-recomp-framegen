@@ -4448,6 +4448,8 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
             g.c7 = ex->ubo[NVN_STAGE_VS][4].addr != 0;   // bank c7
             g.cb = ex->cb, g.fence = ex->fence;
             g.c7_addr = ex->ubo[NVN_STAGE_VS][4].addr;
+            // the scene camera block (vk_dlaa.c note_camera's test): its first 3x4 is the view matrix
+            g.cam_addr = ex->ubo[NVN_STAGE_VS][1].size == 0x940 ? ex->ubo[NVN_STAGE_VS][1].addr : 0;
             g.vs = D->B.st.vs;
             const VkExecTarget *z = &ex->depth;
             g.scene = z->image && z->width >= DLAA_SCENE_MIN_W && z->format == VK_FORMAT_D32_SFLOAT &&
