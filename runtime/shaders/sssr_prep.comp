@@ -1,0 +1,77 @@
+#version 450
+// Inputs for FidelityFX SSSR (runtime/vk_sssr.cpp), made at the scene's composite (the contact shadows' point, where the
+// port's linear depth is sampled by its own passes): the view-space normal and the material parameters (roughness in G)
+// from that depth. sssr_conv.comp turns the normal into world space later, at the point SSSR runs.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D lin_depth;              // view distance / far
+layout(binding = 1) uniform sampler2D lit;                    // the lit scene colour: its local detail says how rough
+layout(binding = 2, rgba16f) uniform image2D normal_out;      // xyz: the view-space normal, w: 1
+layout(binding = 3, rgba16f) uniform image2D material_out;    // r: 1 (AO), g: roughness squared, b: view distance, a: 1
+
+layout(push_constant) uniform Params {
+    vec4 proj;    // x, y projection scales; far; unused
+    vec4 size;    // width, height, 1/width, 1/height
+} pc;
+
+vec3 view_pos(vec2 uv, float z) {   // z: distance in front of the camera
+    vec2 ndc = uv * 2.0 - 1.0;
+    return vec3(ndc.x * z / pc.proj.x, -ndc.y * z / pc.proj.y, -z);
+}
+
+vec3 pos_at(ivec2 q) {
+    q = clamp(q, ivec2(0), ivec2(pc.size.xy) - 1);
+    return view_pos((vec2(q) + 0.5) * pc.size.zw, texelFetch(lin_depth, q, 0).x * pc.proj.z);
+}
+
+// contact_shadow.comp's normal from the depth: on each axis the neighbour nearer in depth, turned toward the camera.
+// step 2: a one-pixel baseline carries the depth quantisation of a 4K image and the reflection rays inherits it as grain.
+vec3 normal_at(ivec2 px, vec3 p) {
+    ivec2 last = ivec2(pc.size.xy) - 1;
+    vec3 l = pos_at(px - ivec2(2, 0)), r = pos_at(px + ivec2(2, 0));
+    vec3 d = pos_at(px - ivec2(0, 2)), u = pos_at(px + ivec2(0, 2));
+    bool take_r = px.x == 0 || (px.x < last.x && abs(r.z - p.z) < abs(p.z - l.z));
+    bool take_u = px.y == 0 || (px.y < last.y && abs(u.z - p.z) < abs(p.z - d.z));
+    vec3 dx = take_r ? r - p : p - l;
+    vec3 dy = take_u ? u - p : p - d;
+    vec3 n = normalize(cross(dx, dy));
+    return dot(n, p) > 0.0 ? -n : n;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.size.x) || px.y >= int(pc.size.y)) return;
+    float d = texelFetch(lin_depth, px, 0).x;
+    if (d <= 0.0 || d >= 0.9995) {   // nothing drawn, or the sky: no ray (roughness 1 reads as "too rough" to SSSR)
+        imageStore(normal_out, px, vec4(0.5, 0.5, 1.0, 1.0));
+        imageStore(material_out, px, vec4(1.0, 1.0, 0.0, 1.0));
+        return;
+    }
+    float z = d * pc.proj.z;
+    vec2 uv = (vec2(px) + 0.5) * pc.size.zw;
+    vec3 p = view_pos(uv, z);
+    vec3 n = normal_at(px, p);
+    if (any(isnan(n))) n = vec3(0.0, 0.0, 1.0);
+    if (dot(n, -p) < 0.0) n = -n;    // the surface faces the camera
+    // Smooth surfaces only: the ground, stone, metal and glazed floors keep their normal over a few pixels; canopy,
+    // grass and edges do not, and their roughness goes up so SSSR spawns no ray there.
+    vec3 n2 = normal_at(px + ivec2(2, 0), pos_at(px + ivec2(2, 0)));
+    vec3 n3 = normal_at(px + ivec2(0, 2), pos_at(px + ivec2(0, 2)));
+    float sm2 = dot(n, n2), sm3 = dot(n, n3);
+    float smooth_w = smoothstep(0.75, 0.97, min(sm2, sm3));
+    // A flat surface in the depth is not a polished one: sand, gravel and soil keep the depth plane too. Their lit colour
+    // carries texture at pixel scale, a glazed floor or water does not, so the local contrast raises the roughness.
+    vec3 c0 = texelFetch(lit, px, 0).rgb;
+    float det = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 q = px + ivec2(k == 0 ? 3 : k == 1 ? -3 : 0, k == 2 ? 3 : k == 3 ? -3 : 0);
+        vec3 c1 = texelFetch(lit, clamp(q, ivec2(0), ivec2(pc.size.xy) - 1), 0).rgb;
+        det += abs(dot(c1 - c0, vec3(0.299, 0.587, 0.114)));
+    }
+    det *= 0.25 / max(max(c0.r, max(c0.g, c0.b)), 0.01);
+    float plain = 1.0 - smoothstep(0.02, 0.07, det);
+    float rough = mix(0.6, 0.08, smooth_w * plain);
+    if (z > 40.0) rough = mix(rough, 0.6, smoothstep(40.0, 60.0, z));
+    imageStore(normal_out, px, vec4(n * 0.5 + 0.5, 1.0));
+    imageStore(material_out, px, vec4(1.0, rough * rough, z, 1.0));   // b: the view distance, for sssr_mv.comp
+}

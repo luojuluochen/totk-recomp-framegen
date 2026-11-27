@@ -32,7 +32,7 @@ static struct {
     uint32_t w, h;
     VkImageView src_view[SLOTS];   // the source view each slot's last frame read
     unsigned seen;                 // cfg_version the values below were read at
-    float adj[4];                  // brightness (added), contrast, saturation, gamma
+    float adj[6];                  // brightness (added), contrast, saturation, gamma, green/magenta tint, fog
 } C = {.seen = ~0u};
 
 static int init(VkCtx *c) {
@@ -46,7 +46,7 @@ static int init(VkCtx *c) {
     VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
                                            .bindingCount = 2, .pBindings = b};
-    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
     VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                      .pSetLayouts = &C.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
@@ -120,8 +120,10 @@ static int adjusting(void) {
         C.adj[1] = (float)cfg_double("TOTK_COLOR_CONTRAST") / 100.0f;
         C.adj[2] = (float)cfg_double("TOTK_COLOR_SATURATION") / 100.0f;
         C.adj[3] = (float)cfg_double("TOTK_COLOR_GAMMA");
+        C.adj[4] = (float)cfg_double("TOTK_COLOR_TINT") / 100.0f;
+        C.adj[5] = (float)cfg_double("TOTK_COLOR_FOG") / 100.0f;
     }
-    return C.adj[0] != 0.0f || C.adj[1] != 1.0f || C.adj[2] != 1.0f || C.adj[3] != 1.0f;
+    return C.adj[0] != 0.0f || C.adj[1] != 1.0f || C.adj[2] != 1.0f || C.adj[3] != 1.0f || C.adj[4] != 0.0f || C.adj[5] != 0.0f;
 }
 
 static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkPipelineStageFlags2 ss, VkAccessFlags2 sa,
@@ -163,8 +165,9 @@ VkImage vk_color_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat
          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &oi}};
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, C.pipe);
     rec_push(C.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, C.layout, 0, 2, w);
-    struct { int32_t offset[2], size[2]; float adj[4]; } pc = {{crop[0], crop[1]}, {crop[2], crop[3]},
-                                                              {C.adj[0], C.adj[1], C.adj[2], C.adj[3]}};
+    struct { int32_t offset[2], size[2]; float adj[4], tint[4], fog[4]; } pc = {
+        {crop[0], crop[1]}, {crop[2], crop[3]}, {C.adj[0], C.adj[1], C.adj[2], C.adj[3]},
+        {C.adj[4], 0, 0, 0}, {C.adj[5], 0, 0, 0}};
     vkCmdPushConstants(cb, C.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cb, ((uint32_t)crop[2] + 7) / 8, ((uint32_t)crop[3] + 7) / 8, 1);
     // later submissions that write src wait for this read; FSR and the blit read the output

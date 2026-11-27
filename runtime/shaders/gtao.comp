@@ -1,0 +1,95 @@
+#version 450
+// Screen-space ambient occlusion (GTAO's horizon integration, depth-only) at the scene's composite point, the same
+// place the contact shadows run (runtime/vk_contact.c's job). Each pixel takes the largest horizon angle over a few
+// directions in the linear depth around it and darkens the scene colour by the occlusion. Depth normals keep it
+// independent of the game's G-buffer, so it needs nothing but the depth target the port already captures.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D lin_depth;                // the game's linear depth: view distance / far
+layout(binding = 1, r11f_g11f_b10f) uniform image2D scene;      // the lit scene colour, darkened in place
+
+layout(push_constant) uniform Params {
+    vec4 proj;    // projection x scale, y scale, far plane, strength (0..1)
+    vec4 size;    // width, height, 1/width, 1/height
+    vec4 opt;     // x: debug (1: the AO as grey), y: radius in metres at 10 m, z: steps, w: directions
+} pc;
+
+vec3 view_pos(vec2 uv, float z) {   // z: distance in front of the camera
+    vec2 ndc = uv * 2.0 - 1.0;
+    return vec3(ndc.x * z / pc.proj.x, -ndc.y * z / pc.proj.y, -z);
+}
+
+vec3 pos_at(ivec2 q) {   // the view-space position of a pixel, clamped to the image
+    q = clamp(q, ivec2(0), ivec2(pc.size.xy) - 1);
+    return view_pos((vec2(q) + 0.5) * pc.size.zw, texelFetch(lin_depth, q, 0).x * pc.proj.z);
+}
+
+// The surface normal from the linear depth (contact_shadow.comp's): on each axis the neighbour nearer in depth, so an
+// edge pixel takes the slope of its own surface rather than the step to what lies behind it. Turned toward the camera.
+vec3 normal_at(ivec2 px, vec3 p) {
+    ivec2 last = ivec2(pc.size.xy) - 1;
+    vec3 l = pos_at(px - ivec2(1, 0)), r = pos_at(px + ivec2(1, 0));
+    vec3 d = pos_at(px - ivec2(0, 1)), u = pos_at(px + ivec2(0, 1));
+    bool take_r = px.x == 0 || (px.x < last.x && abs(r.z - p.z) < abs(p.z - l.z));
+    bool take_u = px.y == 0 || (px.y < last.y && abs(u.z - p.z) < abs(p.z - d.z));
+    vec3 dx = take_r ? r - p : p - l;
+    vec3 dy = take_u ? u - p : p - d;
+    vec3 n = normalize(cross(dx, dy));
+    return dot(n, p) > 0.0 ? -n : n;
+}
+
+float ign(vec2 px) {   // interleaved gradient noise: a per-pixel rotation that hides the step pattern
+    return fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715))));
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.size.x) || px.y >= int(pc.size.y)) return;
+    float d = texelFetch(lin_depth, px, 0).x;
+    if (d <= 0.0 || d >= 0.999) return;   // nothing drawn, or the sky
+    float z = d * pc.proj.z;
+    if (z > 60.0) return;
+    vec2 uv = (vec2(px) + 0.5) * pc.size.zw;
+    vec3 p = view_pos(uv, z);
+    vec3 n = normal_at(px, p);
+    if (!(dot(n, -p) > 0.0)) return;      // backfacing, or a NaN normal: the samples are skipped rather than writing NaN
+    // The radius grows with distance as one pixel covers more ground, so the AO keeps its world-space size.
+    float radius = pc.opt.y * clamp(z / 10.0, 0.5, 4.0);
+    vec2 rad_uv = radius * vec2(pc.proj.x, pc.proj.y) / z;   // the ring's radius in UV along x and y
+    int steps = int(clamp(pc.opt.z, 1.0, 12.0));
+    int dirs = int(clamp(pc.opt.w, 1.0, 16.0));
+    float rot = ign(vec2(px)) * 6.2831853;
+    float occ = 0.0, wsum = 0.0;
+    for (int k = 0; k < 16; k++) {
+        if (k >= dirs) break;
+        float a = rot + 6.2831853 * float(k) / float(dirs);
+        vec2 dir = vec2(cos(a), sin(a));
+        float maxh = -1.0;   // the largest horizon angle in this direction, as the sine of the angle above the tangent
+        float wgt = 0.0;
+        for (int s = 1; s <= 12; s++) {
+            if (s > steps) break;
+            float t = float(s) / float(steps);
+            vec2 suv = uv + dir * rad_uv * t;
+            if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) break;
+            float sd = texelFetch(lin_depth, ivec2(suv * pc.size.xy), 0).x;
+            if (sd <= 0.0 || sd >= 0.999) continue;
+            vec3 q = view_pos(suv, sd * pc.proj.z);
+            vec3 v = q - p;
+            float l = length(v);
+            if (l < 1e-4 || l > radius * 1.8) continue;   // a step to what lies behind is not this surface's horizon
+            float h = dot(v, n) / l;                      // positive above the tangent plane: the horizon covers the pixel
+            if (h > maxh) maxh = h, wgt = 1.0 - t;        // nearer samples occlude more
+        }
+        if (maxh > 0.0) occ += maxh * (wgt + 0.5);
+        wsum += 1.0;
+    }
+    // A visibility gain of 1.5: the mean horizon sine is small in open areas, so the strength maps onto the useful range.
+    float ao = 1.0 - pc.proj.w * clamp(occ / max(wsum, 1.0) * 1.5, 0.0, 1.0);
+    if (pc.opt.x > 0.5) {   // debug: the AO as grey
+        imageStore(scene, px, vec4(ao, ao, ao, 1.0));
+        return;
+    }
+    if (ao >= 0.999) return;
+    vec4 c = imageLoad(scene, px);
+    imageStore(scene, px, vec4(c.rgb * ao, c.a));
+}

@@ -23,6 +23,7 @@
 // the picture before the HUD, in place of the frame instead, for checks only).
 #include "vk_fg.h"
 #include "vk_fsr3.h"
+#include "vk_sssr.h"
 
 #include <malloc.h>
 #include <math.h>
@@ -58,6 +59,9 @@ extern "C" FfxErrorCode ffxGetPermutationBlobByIndex(FfxEffect effect, FfxPass p
         return FFX_OK;
     }
     if (effect == FFX_EFFECT_FSR3UPSCALER && vk_fsr3_blob(pass, options, out)) return FFX_OK;   // the upscaler's (vk_fsr3.cpp)
+    if ((effect == FFX_EFFECT_SSSR || effect == FFX_EFFECT_DENOISER) &&
+        vk_sssr_blob(effect, pass, options, out))   // SSW's reflections and their denoiser (vk_sssr.cpp)
+        return FFX_OK;
     rt_log("fg: no shader for effect %d pass %d", (int)effect, (int)pass);
     return FFX_ERROR_INVALID_ARGUMENT;
 }

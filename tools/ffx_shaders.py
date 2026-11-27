@@ -61,6 +61,19 @@ FU_DEFS = ['-DFFX_FSR3UPSCALER_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0',
            '-DFFX_FSR3UPSCALER_OPTION_JITTERED_MOTION_VECTORS=0',
            '-DFFX_FSR3UPSCALER_OPTION_INVERTED_DEPTH=0']
 
+# Stochastic screen-space reflections (runtime/vk_sssr.cpp): FfxSssrPass order, one permutation (depth not inverted)
+SSSR_PASSES = ['depth_downsample_pass', 'classify_tiles_pass', 'prepare_blue_noise_texture_pass',
+               'prepare_indirect_args_pass', 'intersect_pass']
+SSSR_DEFS = ['-DFFX_SSSR_OPTION_INVERTED_DEPTH=0']
+# The SDK's denoiser, FfxDenoiserPass order: the three reflections passes are the ones SSSR dispatches (the shadow ones
+# keep an empty blob); they are compiled in one more permutation, depth not inverted.
+DEN_PASSES = ['prepare_shadow_mask_pass', 'shadows_tile_classification_pass', 'filter_soft_shadows_0_pass',
+              'filter_soft_shadows_1_pass', 'filter_soft_shadows_2_pass', 'reproject_reflections_pass',
+              'prefilter_reflections_pass', 'resolve_temporal_reflections_pass']
+DEN_COMPILED = DEN_PASSES[5:]   # (blobs for 0..4 stay empty)
+DEN_REFLECTIONS = ['reproject_reflections_pass', 'prefilter_reflections_pass', 'resolve_temporal_reflections_pass']
+DEN_DEFS = ['-DFFX_DENOISER_OPTION_INVERTED_DEPTH=0']
+
 # SPIR-V opcodes / enums used below
 OP_NAME, OP_ENTRY, OP_CONSTANT, OP_DECORATE, OP_MEMBER_DECORATE = 5, 15, 43, 71, 72
 OP_TYPE_IMAGE, OP_TYPE_SAMPLER, OP_TYPE_ARRAY, OP_TYPE_RUNTIME_ARRAY, OP_TYPE_STRUCT, OP_TYPE_POINTER, OP_VARIABLE = \
@@ -159,7 +172,8 @@ def main():
         del args[k:k + 2]
     sdk = str(ROOT / 'runtime' / 'third_party' / 'FidelityFX' / 'sdk')
     spirv = ROOT / 'runtime' / 'third_party' / 'FidelityFX' / 'spirv'
-    out = args[0] if args else str(spirv / ('ffx_fsr3upscaler_vk.h' if effects == {'fu'} else 'ffx_shaders_vk.h'))
+    out = args[0] if args else str(spirv / ('ffx_fsr3upscaler_vk.h' if effects == {'fu'} else
+                                           'ffx_sssr_vk.h' if effects == {'sssr'} else 'ffx_shaders_vk.h'))
     glslang = args[1] if len(args) > 1 else default_glslang()
     gpu = os.path.join(sdk, 'include', 'FidelityFX', 'gpu')
     shaders = os.path.join(sdk, 'src', 'backends', 'vk', 'shaders')
@@ -174,6 +188,14 @@ def main():
         src = os.path.join(shaders, 'opticalflow', 'ffx_opticalflow_%s.glsl' % p)
         spv = compile_glsl(glslang, src, [gpu, os.path.join(gpu, 'opticalflow')], OF_DEFS)
         blobs.append(('of_%s' % p, spv, reflect(spv)))
+    for p in SSSR_PASSES if 'sssr' in effects else ():
+        src = os.path.join(shaders, 'sssr', 'ffx_sssr_%s.glsl' % p)
+        spv = compile_glsl(glslang, src, [gpu, os.path.join(gpu, 'sssr')], SSSR_DEFS)
+        blobs.append(('sssr_%s' % p, spv, reflect(spv)))
+    for p in DEN_COMPILED if 'sssr' in effects else ():
+        src = os.path.join(shaders, 'denoiser', 'ffx_denoiser_%s.glsl' % p)
+        spv = compile_glsl(glslang, src, [gpu, os.path.join(gpu, 'denoiser')], DEN_DEFS)
+        blobs.append(('den_%s' % p, spv, reflect(spv)))
     for half in (0, 1) if 'fu' in effects else ():  # (16-bit floats where the SDK asks and the device has them)
         for e in FU_PASSES:
             if e is None:
@@ -233,6 +255,16 @@ def main():
             L += ['    {},' if e is None else blob('fu%d_%s_%d' % ((half,) + e), refl['fu%d_%s_%d' % ((half,) + e)])
                   for e in FU_PASSES]
             L.append(' },')
+        L.append('};')
+    if 'sssr' in effects:
+        refl = {c: r for c, _, r in blobs}
+        L.append('// [FfxSssrPass] (depth not inverted)')
+        L.append('static const FfxShaderBlob ffx_sssr_blobs[%d] = {' % len(SSSR_PASSES))
+        L += [blob('sssr_%s' % p, refl['sssr_%s' % p]) for p in SSSR_PASSES]
+        L.append('};')
+        L.append('// [FfxDenoiserPass]: the shadow passes keep an empty blob (this context denoises reflections only)')
+        L.append('static const FfxShaderBlob ffx_den_blobs[%d] = {' % len(DEN_PASSES))
+        L += ['    {},' if p not in DEN_COMPILED else blob('den_%s' % p, refl['den_%s' % p]) for p in DEN_PASSES]
         L.append('};')
     with open(out, 'w', newline='\n') as f:
         f.write('\n'.join(L) + '\n')

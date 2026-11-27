@@ -1,0 +1,40 @@
+#version 450
+// The softening of the ray shadows (runtime/shaders/rt_shadow.comp writes the occupancy mask): a depth-aware 3x3 blur of
+// the mask, then the lit colour is darkened by it. The blur turns the per-pixel ray noise of a moving scene into a
+// smooth penumbra and stops it shimmering; the depth test keeps it from bleeding across object edges.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D mask;                  // the occupancy: 0 lit, 1 blocked
+layout(binding = 1) uniform sampler2D lin_depth;             // view distance / far, for the depth test
+layout(binding = 2, r11f_g11f_b10f) uniform image2D scene;   // the lit scene colour, darkened in place
+
+layout(push_constant) uniform Params {
+    vec4 proj;    // far plane, strength (0..1), unused, unused
+    vec4 size;    // width, height, 1/width, 1/height
+} pc;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.size.x) || px.y >= int(pc.size.y)) return;
+    float d0 = texelFetch(lin_depth, px, 0).x;
+    float m = 0.0, wsum = 0.0;
+    // 5x5 with gaussian weights: the four-ray pattern a pixel gets changes as the camera moves, and a wide blur is
+    // what stops the edges from crawling.
+    for (int y = -2; y <= 2; y++)
+        for (int x = -2; x <= 2; x++) {
+            ivec2 q = clamp(px + ivec2(x, y), ivec2(0), ivec2(pc.size.xy) - 1);
+            float d = texelFetch(lin_depth, q, 0).x;
+            float g = exp(-float(x * x + y * y) * 0.35);
+            float w = abs(d - d0) <= 0.02 + 0.002 * d0 * pc.proj.x ? g : 0.0;
+            m += texelFetch(mask, q, 0).r * w;
+            wsum += w;
+        }
+    if (wsum <= 0.0) return;
+    // Never below 0.4: a shadowed pixel still has the sky's and the bounce's light, and a full-strength dial used to
+    // paint the tree tops black.
+    float eff = pc.proj.y * 0.6;
+    float k = 1.0 - eff * (m / wsum);
+    if (k >= 0.999) return;
+    vec4 c = imageLoad(scene, px);
+    imageStore(scene, px, vec4(c.rgb * k, c.a));
+}

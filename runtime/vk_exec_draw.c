@@ -4434,7 +4434,29 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
     ex->recorded++;
-    if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
+    if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) {
+        mvobj_draw(ex, d, sp.buffer, sp.offset);
+        if (vk_rt_geom_on() || vk_rt_shadows_on()) {   // TOTK_RT: what this draw offers a BVH (vk_rt.c)
+            VkRtGeomDraw g;
+            memset(&g, 0, sizeof g);
+            g.prim = (uint32_t)d->prim, g.count = (uint32_t)d->count, g.itype = d->itype, g.base_vertex = d->base_vertex;
+            g.ib = sp.buffer, g.ib_off = sp.offset;
+            for (int b = 0; b < 16; b++)
+                g.vb[b] = D->B.vb[b], g.vb_off[b] = D->B.vo[b], g.vb_stride[b] = D->B.vstr[b], g.vb_size[b] = D->B.vsz[b];
+            memcpy(g.attr, ex->pipe.vattr, sizeof g.attr);
+            g.c5 = ex->ubo[NVN_STAGE_VS][2].addr != 0;   // bank c5
+            g.c7 = ex->ubo[NVN_STAGE_VS][4].addr != 0;   // bank c7
+            g.cb = ex->cb, g.fence = ex->fence;
+            g.c7_addr = ex->ubo[NVN_STAGE_VS][4].addr;
+            // the scene camera block (vk_dlaa.c note_camera's test): its first 3x4 is the view matrix
+            g.cam_addr = ex->ubo[NVN_STAGE_VS][1].size == 0x940 ? ex->ubo[NVN_STAGE_VS][1].addr : 0;
+            g.vs = D->B.st.vs;
+            const VkExecTarget *z = &ex->depth;
+            g.scene = z->image && z->width >= DLAA_SCENE_MIN_W && z->format == VK_FORMAT_D32_SFLOAT &&
+                      D->B.st.samples <= 1 && D->B.st.ds.dt && D->B.st.ds.dw;
+            vk_rt_geom_draw(&g);
+        }
+    }
 }
 
 // DrawElementsIndirect: the arguments are read by the GPU from the pool buffer (they are often written by an earlier

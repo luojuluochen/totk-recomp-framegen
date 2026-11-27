@@ -678,6 +678,12 @@ static void row_shadow_range(void) {
     opt_choice_list("TOTK_SHADOW_RANGE", UI_MENU_SHADOW_RANGE, vals, names, 4, UI_MENU_SHADOW_RANGE_DESC);
 }
 
+static void row_sssr(void) {
+    static const char *const vals[] = {"0", "50", "100", "150", "200"};
+    const char *names[] = {menu_text(UI_MENU_OFF), "50 %", "100 %", "150 %", "200 %"};
+    opt_choice_list("TOTK_SSSR", UI_MENU_SSSR, vals, names, 5, UI_MENU_SSSR_DESC);
+}
+
 static void row_grass_range(void) {
     static const char *const vals[] = {"50", "100", "150", "200", "300", "400"};
     static const char *const names[] = {"31 m (0.5x)", "62 m (1x)",  "94 m (1.5x)",
@@ -783,6 +789,8 @@ static void rows_color(void) {
     moved |= opt_slider("TOTK_COLOR_SATURATION", UI_MENU_COLOR_SATURATION, 50, 200, UI_MENU_COLOR_SATURATION_DESC, 5,
                         "%.0f %%");
     moved |= opt_slider("TOTK_COLOR_GAMMA", UI_MENU_COLOR_GAMMA, 0.8f, 1.2f, UI_MENU_COLOR_GAMMA_DESC, 0.02f, "%.2f");
+    moved |= opt_slider("TOTK_COLOR_TINT", UI_MENU_COLOR_TINT, -100, 100, UI_MENU_COLOR_TINT_DESC, 5, "%+.0f %%");
+    moved |= opt_slider("TOTK_COLOR_FOG", UI_MENU_COLOR_FOG, 0, 100, UI_MENU_COLOR_FOG_DESC, 5, "%.0f %%");
     if (moved && strcmp(cfg_value("TOTK_COLOR_PRESET"), "custom")) {
         cfg_set("TOTK_COLOR_PRESET", "custom");
         cfg_save();
@@ -818,6 +826,7 @@ static void tab_screen(float scale) {
     row_shadow_scale();
     row_shadow_range();
     row_grass_range();
+    row_sssr();
     opt_toggle("TOTK_LOD_STEADY", UI_MENU_LOD_STEADY, UI_MENU_LOD_STEADY_DESC);
     opt_slider("TOTK_PCSS", UI_MENU_PCSS, 0, 200, UI_MENU_PCSS_DESC, 10, "%.0f %%");
     opt_slider("TOTK_CONTACT_SHADOWS", UI_MENU_CONTACT_SHADOWS, 0, 100, UI_MENU_CONTACT_SHADOWS_DESC, 10, "%.0f %%");

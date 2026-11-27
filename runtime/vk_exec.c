@@ -26,6 +26,7 @@
 #include "platform/platform.h"
 #include "tex.h"
 #include "vk.h"
+#include "vk_sssr.h"
 #include "vk_dlaa.h"
 #include "vk_exec.h"
 
@@ -1053,8 +1054,15 @@ static void run_job(VkExec *ex) {
         j.sun.img = ui, j.sun.image = ui ? ui->image : VK_NULL_HANDLE;
         if (si && di) {
             j.scene.img = si, j.scene.image = si->image, j.depth.img = di, j.depth.image = di->image;
-            vk_contact_exec(ex, &j);
+            if (vk_contact_strength()) vk_contact_exec(ex, &j);
         }
+        // The scene's draws are all recorded before this point: build the frame's TLAS here (vk_rt.c), and make
+        // FidelityFX SSSR's inputs from the linear depth (vk_sssr.cpp).
+        vk_rt_shadow_exec(ex, &j);
+        if (vk_sssr_on() &&
+            vk_sssr_prepare(ex->cb, (uint64_t)(uintptr_t)j.depth.image, (uint64_t)(uintptr_t)j.scene.image,
+                            j.scene.width, j.scene.height, j.pc[0], j.pc[1], j.pc[2]))
+            vk_exec_draw_new_cb(ex);   // the pass bound pipelines and descriptors of its own
     }
     __atomic_store_n(&job_turn, turn + 1, __ATOMIC_RELEASE);
     ex->dirty = VK_EXEC_DIRTY_ALL;

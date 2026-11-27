@@ -38,7 +38,8 @@ typedef struct VkCtx {
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
         has_calibrated,                     // VK_KHR/EXT_calibrated_timestamps (GPU idle split in the perf line)
         has_hdr_metadata,                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
-        has_nv_reflex;                      // VK_NV_low_latency2 (NVIDIA Reflex Low Latency)
+        has_nv_reflex,                      // VK_NV_low_latency2 (NVIDIA Reflex Low Latency)
+        has_accel_struct, has_ray_query;    // VK_KHR_acceleration_structure / ray_query (TOTK_RT=1, vk_rt.c)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -612,6 +613,41 @@ void vk_present_drain(void);               // returns once every queued present 
 int vk_replay_async(void);                 // TOTK_REPLAY_ASYNC (default 0): submissions replay on the replay thread
 void vk_program_release(const prog_t *p);  // GfxBackend.program_release: vk_pipeline.c; weak no-op in vk_backend.c
 void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem_shutdown, vk_shutdown in that order
+
+// ---- ray tracing (vk_rt.c)
+// Off by default: the extensions and their features are enabled in vk_device.c only when TOTK_RT is set (1, probe,
+// check), so a start without it is exactly as before. TOTK_RT=probe builds a one-triangle BLAS and a one-instance
+// TLAS on the GPU and frees them, to prove the driver path before the real passes exist.
+void vk_rt_init(void);   // after the device is up: load the entry points, log what the GPU reports, run the probe
+int  vk_rt_ready(void);  // 1: VK_KHR_acceleration_structure + VK_KHR_ray_query enabled, entry points loaded
+
+// Geometry capture, first as a census (TOTK_RT=geom): one indexed scene draw as vk_exec_draw.c records it. The counts
+// say how much of the scene's geometry the port can hand a BVH, and whether the draws' own buffers carry the device
+// addresses a bottom level structure needs (vk_memory.c pool_usage adds the usage flag when RT is on).
+typedef struct {
+    uint32_t prim, count;      // NVN topology, index count
+    int32_t itype, base_vertex;
+    VkBuffer ib; VkDeviceSize ib_off;
+    VkBuffer vb[16]; VkDeviceSize vb_off[16], vb_stride[16], vb_size[16];
+    uint32_t attr[16];         // NVNvertexAttribState: fmt:8, offset:19, stream:5
+    int scene;                 // the scene G-buffer pass (vk_dlaa_draw's test)
+    int c5, c7;                // the vertex shader reads an object's bones (c5) and place (c7)
+    VkCommandBuffer cb;        // the replay's command buffer: a new BLAS's build is recorded into it
+    uint64_t fence;            // the submission's timeline value (scratch buffers are freed after it)
+    uint64_t c7_addr;          // guest address of the object's 3x4 place (bank c7's block), 0: none
+    uint64_t cam_addr;         // guest address of the scene camera block (view matrix in its first 3x4), 0: none
+    const GfxShader *vs;       // the draw's vertex shader (its resource list says whether c7 is read)
+} VkRtGeomDraw;
+int  vk_rt_geom_on(void);   // TOTK_RT=geom (or 1): the census runs
+void vk_rt_geom_draw(const VkRtGeomDraw *d);
+// Scene BVH (TOTK_RT=bvh or 1): a BLAS per unique piece of geometry, a TLAS rebuilt at the scene's composite (the same
+// point the contact shadows use, vk_contact.c). The TLAS is what the ray-query passes trace against (vk_rt_shadow.c).
+struct VkExec;      // vk_exec.h (included after this header by the replay and vk_rt.c)
+struct VkExecJob;
+int  vk_rt_shadows_on(void);
+void vk_rt_shadow_exec(struct VkExec *ex, const struct VkExecJob *j);
+void vk_rt_shadow_apply(void *cb, uint64_t scene, uint32_t w, uint32_t h, const float *cam);
+void vk_rt_shutdown(void);  // at device teardown, after vkDeviceWaitIdle
 
 // ---- pipelines (vk_pipeline.c)
 // Binding model (comment block at the top of vk_pipeline.c): one descriptor set, set 0, per pipeline. Binding 0 is
