@@ -10,6 +10,7 @@
 #include "host.h"
 #include "memx.h"
 #include "vk.h"
+void cfg_auto_preset(VkPhysicalDevice phys);
 #include "platform/platform.h"
 #include "vk_dlaa.h"
 #include "vk_fg.h"
@@ -438,6 +439,7 @@ static int create_device(void) {
                (unsigned long long)asp.maxGeometryCount, (unsigned long long)asp.maxInstanceCount,
                (unsigned long long)asp.maxPrimitiveCount, asp.minAccelerationStructureScratchOffsetAlignment);
     }
+    cfg_auto_preset(g_vk.phys);   // first-run defaults from the GPU's VRAM (runtime/auto_preset.c)
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     // Vulkan 1.3 requires the feature, and the chain goes to vkCreateDevice as the driver filled it, so it is enabled
     // wherever reported; vk_pipeline.c spirv_demote emits OpDemoteToHelperInvocation only when it is.
