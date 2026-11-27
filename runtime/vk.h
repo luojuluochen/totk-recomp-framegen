@@ -646,6 +646,7 @@ struct VkExec;      // vk_exec.h (included after this header by the replay and v
 struct VkExecJob;
 int  vk_rt_shadows_on(void);
 void vk_rt_shadow_exec(struct VkExec *ex, const struct VkExecJob *j);
+void vk_rt_shadow_apply(void *cb, uint64_t scene, uint32_t w, uint32_t h, const float *cam);
 void vk_rt_shutdown(void);  // at device teardown, after vkDeviceWaitIdle
 
 // ---- pipelines (vk_pipeline.c)

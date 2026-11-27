@@ -29,6 +29,7 @@ extern "C" {
 
 #include "sssr_apply_spv.h"   // tools/build_shaders.py
 #include "sssr_conv_spv.h"
+#include "sssr_mv_spv.h"
 #include "sssr_prep_spv.h"
 
 // The SDK's shaders: tools/ffx_shaders.py --effects sssr (spirv/ffx_sssr_vk.h)
@@ -58,14 +59,14 @@ static struct {
     FfxInterface iface;
     void *scratch;
     uint32_t w, h;
-    VkImage nv, nw, mat, out, env, lut;   // view-space normal, world-space normal, roughness, radiance, env cube, BRDF LUT
-    VmaAllocation nv_a, nw_a, mat_a, out_a, env_a, lut_a;
-    VkImageView nv_v, nw_v, mat_v, out_v, env_v, lut_v;
+    VkImage nv, nw, mat, out, mv, env, lut;   // view-space normal, world-space normal, roughness, radiance, env cube, BRDF LUT
+    VmaAllocation nv_a, nw_a, mat_a, out_a, mv_a, env_a, lut_a;
+    VkImageView nv_v, nw_v, mat_v, out_v, mv_v, env_v, lut_v;
     VkSampler samp, splin;                // nearest (prep's depth), linear (SSSR's result, conv's normal)
     PFN_vkCmdPushDescriptorSetKHR push;
-    VkDescriptorSetLayout prep_dsl, conv_dsl, apply_dsl;
-    VkPipelineLayout prep_lay, conv_lay, apply_lay;
-    VkPipeline prep_pipe, conv_pipe, apply_pipe;
+    VkDescriptorSetLayout prep_dsl, conv_dsl, mv_dsl, apply_dsl;
+    VkPipelineLayout prep_lay, conv_lay, mv_lay, apply_lay;
+    VkPipeline prep_pipe, conv_pipe, mv_pipe, apply_pipe;
     float prev_vp[16];
     bool have_prev;
     uint32_t prep_w, prep_h;              // the size prepare ran at this frame
@@ -149,6 +150,15 @@ static bool inv4(const float *m, float *o) {   // double precision; false for a 
     return true;
 }
 
+static void mul4(const float *a, const float *b, float *o) {   // o = a * b, column-major
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            double s_ = 0.0;
+            for (int k = 0; k < 4; k++) s_ += (double)a[k * 4 + r] * b[c * 4 + k];
+            o[c * 4 + r] = (float)s_;
+        }
+}
+
 // ---- views of the game's images (kept: a view destroyed while a recorded command uses it faults the driver) --------
 static struct { VkImage img; VkFormat fmt; VkImageAspectFlags asp; VkImageView view; } *VC;
 static int VC_n, VC_cap;
@@ -192,10 +202,10 @@ static bool img2d(VkCtx *c, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlag
 }
 
 static void destroy_images(VkCtx *c) {
-    VkImage *im[6] = {&S.nv, &S.nw, &S.mat, &S.out, &S.env, &S.lut};
-    VmaAllocation *al[6] = {&S.nv_a, &S.nw_a, &S.mat_a, &S.out_a, &S.env_a, &S.lut_a};
-    VkImageView *vi[6] = {&S.nv_v, &S.nw_v, &S.mat_v, &S.out_v, &S.env_v, &S.lut_v};
-    for (int i = 0; i < 6; i++) {
+    VkImage *im[7] = {&S.nv, &S.nw, &S.mat, &S.out, &S.mv, &S.env, &S.lut};
+    VmaAllocation *al[7] = {&S.nv_a, &S.nw_a, &S.mat_a, &S.out_a, &S.mv_a, &S.env_a, &S.lut_a};
+    VkImageView *vi[7] = {&S.nv_v, &S.nw_v, &S.mat_v, &S.out_v, &S.mv_v, &S.env_v, &S.lut_v};
+    for (int i = 0; i < 7; i++) {
         if (*vi[i]) vkDestroyImageView(c->device, *vi[i], NULL), *vi[i] = VK_NULL_HANDLE;
         if (*im[i]) vmaDestroyImage(c->vma, *im[i], *al[i]), *im[i] = VK_NULL_HANDLE;
     }
@@ -206,7 +216,8 @@ static bool make_images(VkCtx *c, uint32_t w, uint32_t h) {
     if (!img2d(c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, su, &S.nv, &S.nv_a, &S.nv_v) ||
         !img2d(c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, su, &S.nw, &S.nw_a, &S.nw_v) ||
         !img2d(c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, su, &S.mat, &S.mat_a, &S.mat_v) ||
-        !img2d(c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, su, &S.out, &S.out_a, &S.out_v))
+        !img2d(c, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, su, &S.out, &S.out_a, &S.out_v) ||
+        !img2d(c, w, h, VK_FORMAT_R16G16_SFLOAT, su, &S.mv, &S.mv_a, &S.mv_v))
         return false;
     // The environment map SSSR falls back to when a ray leaves the screen, and the BRDF LUT its composite reads: black,
     // since the port has no sky probe, so a missed ray adds nothing.
@@ -276,10 +287,12 @@ static bool make_pipelines(VkCtx *c) {
     if (vkCreateSampler(c->device, &si, NULL, &S.splin) != VK_SUCCESS) return false;
     const VkDescriptorType sam = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sto = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     const VkDescriptorType tprep[4] = {sam, sam, sto, sto}, tconv[2] = {sam, sto}, tap[3] = {sam, sam, sto};
+    const VkDescriptorType tmv[2] = {sam, sto};
     return make_one_pipeline(c, sssr_prep_spv, sizeof sssr_prep_spv, 4, tprep, 32, &S.prep_dsl, &S.prep_lay,
                              &S.prep_pipe) &&
            make_one_pipeline(c, sssr_conv_spv, sizeof sssr_conv_spv, 2, tconv, 64, &S.conv_dsl, &S.conv_lay,
                              &S.conv_pipe) &&
+           make_one_pipeline(c, sssr_mv_spv, sizeof sssr_mv_spv, 2, tmv, 96, &S.mv_dsl, &S.mv_lay, &S.mv_pipe) &&
            make_one_pipeline(c, sssr_apply_spv, sizeof sssr_apply_spv, 3, tap, 96, &S.apply_dsl, &S.apply_lay,
                              &S.apply_pipe);
 }
@@ -314,12 +327,15 @@ static void destroy_all(VkCtx *c) {
         destroy_images(c);
         if (S.prep_pipe) vkDestroyPipeline(c->device, S.prep_pipe, NULL), S.prep_pipe = VK_NULL_HANDLE;
         if (S.conv_pipe) vkDestroyPipeline(c->device, S.conv_pipe, NULL), S.conv_pipe = VK_NULL_HANDLE;
+        if (S.mv_pipe) vkDestroyPipeline(c->device, S.mv_pipe, NULL), S.mv_pipe = VK_NULL_HANDLE;
         if (S.apply_pipe) vkDestroyPipeline(c->device, S.apply_pipe, NULL), S.apply_pipe = VK_NULL_HANDLE;
         if (S.prep_lay) vkDestroyPipelineLayout(c->device, S.prep_lay, NULL), S.prep_lay = VK_NULL_HANDLE;
         if (S.conv_lay) vkDestroyPipelineLayout(c->device, S.conv_lay, NULL), S.conv_lay = VK_NULL_HANDLE;
+        if (S.mv_lay) vkDestroyPipelineLayout(c->device, S.mv_lay, NULL), S.mv_lay = VK_NULL_HANDLE;
         if (S.apply_lay) vkDestroyPipelineLayout(c->device, S.apply_lay, NULL), S.apply_lay = VK_NULL_HANDLE;
         if (S.prep_dsl) vkDestroyDescriptorSetLayout(c->device, S.prep_dsl, NULL), S.prep_dsl = VK_NULL_HANDLE;
         if (S.conv_dsl) vkDestroyDescriptorSetLayout(c->device, S.conv_dsl, NULL), S.conv_dsl = VK_NULL_HANDLE;
+        if (S.mv_dsl) vkDestroyDescriptorSetLayout(c->device, S.mv_dsl, NULL), S.mv_dsl = VK_NULL_HANDLE;
         if (S.apply_dsl) vkDestroyDescriptorSetLayout(c->device, S.apply_dsl, NULL), S.apply_dsl = VK_NULL_HANDLE;
         if (S.samp) vkDestroySampler(c->device, S.samp, NULL), S.samp = VK_NULL_HANDLE;
         if (S.splin) vkDestroySampler(c->device, S.splin, NULL), S.splin = VK_NULL_HANDLE;
@@ -380,6 +396,7 @@ static bool ensure(VkCtx *c, uint32_t w, uint32_t h, VkCommandBuffer cb) {
         clear_black(cb, S.lut);
         clear_black(cb, S.out);
         clear_black(cb, S.nw);
+        clear_black(cb, S.mv);
     }
     return true;
 }
@@ -500,12 +517,32 @@ extern "C" int vk_sssr_exec(void *cb_, uint64_t scene, uint64_t depth, uint64_t 
         vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
         barrier(cb);
     }
+    // 1b. the camera's own motion vectors (prevVP * invView, in UV): the port's carry jitter and the objects' motion
+    {
+        float m[16], inv[16];
+        mul4(S.prev_vp, invv, m);
+        VkDescriptorImageInfo mi = {S.samp, S.mat_v, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo oi = {VK_NULL_HANDLE, S.mv_v, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet ws[2] = {
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &mi, NULL, NULL},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &oi, NULL, NULL}};
+        float p4[24] = {proj[0], proj[5], 0, 0, (float)w, (float)h, 1.0f / (float)w, 1.0f / (float)h,
+                        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                        m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]};
+        (void)inv;
+        barrier(cb);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.mv_pipe);
+        S.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.mv_lay, 0, 2, ws);
+        vkCmdPushConstants(cb, S.mv_lay, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p4, p4);
+        vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
+        barrier(cb);
+    }
     // 2. the SDK's dispatch
     FfxSssrDispatchDescription dd = {};
     dd.commandList = ffxGetCommandListVK(cb);
     dd.color = res((VkImage)scene, VK_FORMAT_B10G11R11_UFLOAT_PACK32, w, h, false, L"SSSR_Color");
     dd.depth = res((VkImage)depth, VK_FORMAT_D32_SFLOAT, w, h, false, L"SSSR_Depth");
-    dd.motionVectors = res((VkImage)mv, VK_FORMAT_R16G16_SFLOAT, w, h, false, L"SSSR_MV");
+    dd.motionVectors = res(S.mv, VK_FORMAT_R16G16_SFLOAT, w, h, false, L"SSSR_MV");
     dd.normal = res(S.nw, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, false, L"SSSR_Normal");
     dd.materialParameters = res(S.mat, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, false, L"SSSR_Material");
     dd.environmentMap = res_cube(S.env, 16);
@@ -531,7 +568,7 @@ extern "C" int vk_sssr_exec(void *cb_, uint64_t scene, uint64_t depth, uint64_t 
         const char *yv = cfg_get("TOTK_SSSR_MV_YFLIP");
         if (yv && *yv && strcmp(yv, "0") != 0) mv_yflip = -1.0f;
     }
-    dd.motionVectorScale = {mv_sign / (float)w, mv_yflip / (float)h};
+    dd.motionVectorScale = {1.0f, 1.0f};   // (the pass writes UV already)
     dd.iblFactor = 0.0f;
     dd.normalUnPackMul = 2.0f;
     dd.normalUnPackAdd = -1.0f;
@@ -541,7 +578,7 @@ extern "C" int vk_sssr_exec(void *cb_, uint64_t scene, uint64_t depth, uint64_t 
     dd.depthBufferThickness = 0.015f;
     dd.roughnessThreshold = 0.18f;
     dd.varianceThreshold = 0.0f;
-    dd.maxTraversalIntersections = 48;   // (4K full screen: 128 was far too slow here)
+    dd.maxTraversalIntersections = 64;   // (4K full screen: 128 was far too slow here)
     dd.minTraversalOccupancy = 4;
     dd.mostDetailedMip = 0;
     dd.samplesPerQuad = 1;

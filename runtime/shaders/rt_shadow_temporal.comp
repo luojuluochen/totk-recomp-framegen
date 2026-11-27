@@ -1,0 +1,61 @@
+#version 450
+// The ray shadows' occupancy, smoothed in time and space and applied (runtime/vk_rt.c): rt_shadow.comp writes the
+// occupancy and the view distance at the scene's composite, this pass runs where the camera matrices are (the DLAA
+// point) and reprojects last frame's smoothed occupancy with the camera's own motion, so a pixel's two-ray sample does
+// not flip from frame to frame as the camera moves. A depth test keeps the history from bleeding across edges.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D mask;                  // rg: occupancy, view distance
+layout(binding = 1) uniform sampler2D history;               // rg: last frame's smoothed occupancy, view distance
+layout(binding = 2, rg16f) uniform image2D history_out;      // this frame's, for the next
+layout(binding = 3, r11f_g11f_b10f) uniform image2D scene;   // the lit colour, darkened in place
+
+layout(push_constant) uniform Params {
+    vec4 proj;    // x, y projection scales, strength (0..1), blend (history share)
+    vec4 size;    // width, height, 1/width, 1/height
+    vec4 m0, m1, m2, m3;   // prevVP * invView, columns
+} pc;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.size.x) || px.y >= int(pc.size.y)) return;
+    vec2 m = texelFetch(mask, px, 0).rg;
+    float z = m.g;
+    if (z <= 0.0 || z > 1.0e4) {   // nothing drawn: no shadow, no history
+        imageStore(history_out, px, vec4(0.0));
+        return;
+    }
+    // A depth-aware 5x5 first: the two-ray pattern varies per pixel and frame, the blur averages it out
+    float acc = 0.0, wsum = 0.0;
+    for (int y = -2; y <= 2; y++)
+        for (int x = -2; x <= 2; x++) {
+            ivec2 q = clamp(px + ivec2(x, y), ivec2(0), ivec2(pc.size.xy) - 1);
+            vec2 s = texelFetch(mask, q, 0).rg;
+            float w = abs(s.g - z) <= 0.5 + 0.05 * z ? exp(-float(x * x + y * y) * 0.22) : 0.0;
+            acc += s.r * w;
+            wsum += w;
+        }
+    float occ = wsum > 0.0 ? acc / wsum : m.r;
+    // then the history, from where this surface was last frame
+    vec2 uv = (vec2(px) + 0.5) * pc.size.zw;
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec3 p = vec3(ndc.x * z / pc.proj.x, -ndc.y * z / pc.proj.y, -z);
+    vec4 clip = mat4(pc.m0, pc.m1, pc.m2, pc.m3) * vec4(p, 1.0);
+    if (abs(clip.w) > 1e-6) {
+        vec2 huv = (clip.xy / clip.w) * 0.5 + 0.5;
+        if (all(greaterThan(huv, vec2(0.0))) && all(lessThan(huv, vec2(1.0)))) {
+            vec2 h = texture(history, huv).rg;
+            if (abs(h.g - z) <= 1.0 + 0.1 * z) {
+                // a temporal clamp: this frame may only move the value so far from the history, so an edge pixel's
+                // rays flipping between frames cannot make it blink
+                occ = clamp(occ, h.r - 0.05, h.r + 0.05);
+                occ = mix(occ, h.r, clamp(pc.proj.w, 0.0, 0.95));
+            }
+        }
+    }
+    imageStore(history_out, px, vec4(occ, z, 0.0, 1.0));
+    float k = 1.0 - clamp(pc.proj.z, 0.0, 0.6) * occ;
+    if (k >= 0.999) return;
+    vec4 c = imageLoad(scene, px);
+    imageStore(scene, px, vec4(c.rgb * k, c.a));
+}

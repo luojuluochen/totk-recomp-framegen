@@ -7,7 +7,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D lin_depth;              // view distance / far
 layout(binding = 1) uniform sampler2D lit;                    // the lit scene colour: its local detail says how rough
 layout(binding = 2, rgba16f) uniform image2D normal_out;      // xyz: the view-space normal, w: 1
-layout(binding = 3, rgba16f) uniform image2D material_out;    // r: 1 (AO), g: roughness squared, b: 0, a: 1
+layout(binding = 3, rgba16f) uniform image2D material_out;    // r: 1 (AO), g: roughness squared, b: view distance, a: 1
 
 layout(push_constant) uniform Params {
     vec4 proj;    // x, y projection scales; far; unused
@@ -73,5 +73,5 @@ void main() {
     float rough = mix(0.6, 0.08, smooth_w * plain);
     if (z > 40.0) rough = mix(rough, 0.6, smoothstep(40.0, 60.0, z));
     imageStore(normal_out, px, vec4(n * 0.5 + 0.5, 1.0));
-    imageStore(material_out, px, vec4(1.0, rough * rough, 0.0, 1.0));
+    imageStore(material_out, px, vec4(1.0, rough * rough, z, 1.0));   // b: the view distance, for sssr_mv.comp
 }

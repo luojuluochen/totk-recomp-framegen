@@ -1726,6 +1726,14 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     // FidelityFX SSSR (vk_sssr.cpp) over the colour DLSS is about to read: it binds pipelines and descriptors of its
     // own, so the next draw binds everything again.
     if (!t->level && !t->base_layer && !z->level && !z->base_layer && t->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+        (vk_sssr_on() || vk_rt_shadows_on())) {
+        // the ray shadows' smoothing first (it darkens the colour), the reflections after it
+        if (vk_rt_shadows_on()) {
+            const float *rrows = D.cam_addr ? (const float *)vk_usnap_bytes(D.cam_addr, 11 * 16) : NULL;
+            if (rrows) vk_rt_shadow_apply(cb, (uint64_t)(uintptr_t)t->image, w, h, rrows), vk_exec_draw_new_cb(ex);
+        }
+    }
+    if (!t->level && !t->base_layer && !z->level && !z->base_layer && t->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
         vk_sssr_on()) {
         const float *crows = D.cam_addr ? (const float *)vk_usnap_bytes(D.cam_addr, 11 * 16) : NULL;
         if (crows &&

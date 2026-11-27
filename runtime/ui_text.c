@@ -121,6 +121,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_COLOR_SATURATION_DESC] = "Colour strength against grey; 100 % leaves it.",
     [UI_MENU_COLOR_GAMMA] = "Gamma",
     [UI_MENU_COLOR_GAMMA_DESC] = "Below 1 brightens dark and middle tones, above 1 darkens them; 1 leaves them.",
+    [UI_MENU_COLOR_TINT] = "Tint",
+    [UI_MENU_COLOR_TINT_DESC] = "Shifts the picture between magenta (below 0) and green (above 0); 0 leaves it.",
     [UI_MENU_HDR_GROUP] = "HDR",
     [UI_MENU_HDR] = "HDR output",
     [UI_MENU_HDR_DESC] = "Bright highlights on an HDR display. Needs HDR turned on in Windows (\"Use HDR\") or in a "
@@ -2152,6 +2154,8 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_COLOR_SATURATION_DESC] = "颜色相对灰色的强度；100% 表示不调整。",
     [UI_MENU_COLOR_GAMMA] = "伽马",
     [UI_MENU_COLOR_GAMMA_DESC] = "小于 1 提亮暗部与中间调，大于 1 压暗；1 表示不调整。",
+    [UI_MENU_COLOR_TINT] = "色调微调",
+    [UI_MENU_COLOR_TINT_DESC] = "在偏洋红（小于 0）与偏绿（大于 0）之间调整画面；0 表示不调整。",
     [UI_MENU_FPS_LIMIT] = "帧率上限",
     [UI_MENU_FPS_LIMIT_DESC] = "游戏每秒绘制的最高帧数。高于 60 帧为实验性功能，"
                                "需要开启“游戏速度跟随时钟”。",

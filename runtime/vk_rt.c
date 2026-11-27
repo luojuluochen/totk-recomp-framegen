@@ -14,7 +14,7 @@
 #include "host.h"
 #include "nvn_api.h"   // gfx_counters.frames, the census window
 #include "platform/platform.h"
-#include "rt_shadow_soft_spv.h"
+#include "rt_shadow_temporal_spv.h"
 #include "rt_shadow_spv.h"
 #include "vk.h"
 #include "vk_exec.h"   // VkExec: the replay's command buffer and fence
@@ -605,6 +605,16 @@ static struct {
     VkDescriptorSetLayout soft_dsl;
     VkPipelineLayout soft_lay;
     VkPipeline soft_pipe;
+    // the temporal pass at the DLAA point: last frame's smoothed occupancy and the camera's motion between them
+    VkImage hist[2];
+    VmaAllocation hist_a[2];
+    VkImageView hist_v[2];
+    int hist_cur;
+    uint32_t hist_w, hist_h;
+    float prev_vp[16];
+    int have_prev;
+    uint32_t hist_frames;
+    PFN_vkCmdPushDescriptorSetKHR push_t;
 } S;
 
 static int rt_shadow_init(void) {
@@ -659,23 +669,26 @@ static int rt_shadow_init(void) {
         rt_log("rt: shadows off: the compute pipeline failed (%d)", (int)r);
         return 0;
     }
-    // the softening pass (rt_shadow_soft.comp): the occupancy mask blurred depth-aware, then onto the colour
-    VkDescriptorSetLayoutBinding sb[3] = {
+    // the temporal pass (rt_shadow_temporal.comp): the mask blurred and reprojected into the history, then onto the
+    // colour at the DLAA point, where the camera matrices live
+    VkDescriptorSetLayoutBinding sb[4] = {
         {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
     VkDescriptorSetLayoutCreateInfo sdci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-                                           .bindingCount = 3, .pBindings = sb};
+                                           .bindingCount = 4, .pBindings = sb};
+    VkPushConstantRange tpr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 96};
     VkPipelineLayoutCreateInfo sli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
-                                      .pSetLayouts = &S.soft_dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+                                      .pSetLayouts = &S.soft_dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &tpr};
     VkShaderModuleCreateInfo smi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                    .codeSize = sizeof rt_shadow_soft_spv, .pCode = rt_shadow_soft_spv};
+                                    .codeSize = sizeof rt_shadow_temporal_spv, .pCode = rt_shadow_temporal_spv};
     VkShaderModule sm = VK_NULL_HANDLE;
     if (vkCreateDescriptorSetLayout(c->device, &sdci, NULL, &S.soft_dsl) != VK_SUCCESS ||
         vkCreatePipelineLayout(c->device, &sli, NULL, &S.soft_lay) != VK_SUCCESS ||
         vkCreateShaderModule(c->device, &smi, NULL, &sm) != VK_SUCCESS) {
-        rt_log("rt: shadows off: the softening pass could not be created");
+        rt_log("rt: shadows off: the temporal pass could not be created");
         return 0;
     }
     VkComputePipelineCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -685,10 +698,10 @@ static int rt_shadow_init(void) {
     VkResult sr = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &sci, NULL, &S.soft_pipe);
     vkDestroyShaderModule(c->device, sm, NULL);
     if (sr != VK_SUCCESS) {
-        rt_log("rt: shadows off: the softening pipeline failed (%d)", (int)sr);
+        rt_log("rt: shadows off: the temporal pipeline failed (%d)", (int)sr);
         return 0;
     }
-    rt_log("rt: shadows on: four rays a pixel in a %.1f mrad cone, strength %d%%%s", 6.0, S.strength,
+    rt_log("rt: shadows on: rays a pixel in a small sun cone, strength %d%%%s", S.strength,
            S.debug ? " (debug view: the shadow factor in grey)" : "");
     S.ok = 1;
     return 1;
@@ -710,7 +723,7 @@ static void rt_shadow_record(struct VkExec *ex, const struct VkExecJob *j, VkAcc
         if (S.mask) vmaDestroyImage(mc->vma, S.mask, S.mask_a), S.mask = VK_NULL_HANDLE;
         VkImageCreateInfo mci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                                  .imageType = VK_IMAGE_TYPE_2D,
-                                 .format = VK_FORMAT_R16_SFLOAT,
+                                 .format = VK_FORMAT_R16G16_SFLOAT,
                                  .extent = {j->scene.width, j->scene.height, 1},
                                  .mipLevels = 1,
                                  .arrayLayers = 1,
@@ -723,7 +736,7 @@ static void rt_shadow_record(struct VkExec *ex, const struct VkExecJob *j, VkAcc
         VkImageViewCreateInfo mvi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
                                      .image = S.mask,
                                      .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                                     .format = VK_FORMAT_R16_SFLOAT,
+                                     .format = VK_FORMAT_R16G16_SFLOAT,
                                      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         if (vkCreateImageView(mc->device, &mvi, NULL, &S.mask_v) != VK_SUCCESS) return;
         S.mask_w = j->scene.width, S.mask_h = j->scene.height;
@@ -791,27 +804,6 @@ static void rt_shadow_record(struct VkExec *ex, const struct VkExecJob *j, VkAcc
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(cb, &di);
-    // the mask blurred depth-aware (rt_shadow_soft.comp) and onto the lit colour; the debug views wrote it already
-    if (!S.debug) {
-        VkDescriptorImageInfo mi2 = {S.samp, S.mask_v, VK_IMAGE_LAYOUT_GENERAL};
-        VkDescriptorImageInfo di2 = {S.samp, in, VK_IMAGE_LAYOUT_GENERAL};
-        VkDescriptorImageInfo oi2 = {VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL};
-        VkWriteDescriptorSet sw[3] = {
-            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
-             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &mi2},
-            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
-             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &di2},
-            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1,
-             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &oi2}};
-        float sp[8] = {0.0f, (float)S.strength / 100.0f, 0.0f, 0.0f,
-                       (float)j->scene.width, (float)j->scene.height, 1.0f / (float)j->scene.width,
-                       1.0f / (float)j->scene.height};
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.soft_pipe);
-        S.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.soft_lay, 0, 3, sw);
-        vkCmdPushConstants(cb, S.soft_lay, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof sp, sp);
-        vkCmdDispatch(cb, (j->scene.width + 7) / 8, (j->scene.height + 7) / 8, 1);
-        vkCmdPipelineBarrier2(cb, &di);
-    }
     ex->recorded += 6;
     vk_exec_draw_new_cb(ex);
 }
@@ -918,6 +910,170 @@ void vk_rt_shadow_exec(struct VkExec *ex, const struct VkExecJob *j) {
     plat_rmutex_unlock(&rt_lock);
 }
 
+
+
+// Views of the game's images for the temporal pass. A view destroyed right after recording is used by the GPU a frame
+// later, which faults there: keep them, keyed by image and format, and let go only at shutdown.
+static struct { VkImage img; VkFormat fmt; VkImageView view; } *TV;
+static int TV_n, TV_cap;
+
+static VkImageView temp_view(VkCtx *c, VkImage img, VkFormat fmt) {
+    for (int i = 0; i < TV_n; i++)
+        if (TV[i].img == img && TV[i].fmt == fmt) return TV[i].view;
+    if (TV_n == TV_cap) {
+        int nc = TV_cap ? TV_cap * 2 : 8;
+        void *np = realloc(TV, (size_t)nc * sizeof *TV);
+        if (!np) return VK_NULL_HANDLE;
+        TV = np, TV_cap = nc;
+    }
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = img, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = fmt;
+    vi.subresourceRange = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView v = VK_NULL_HANDLE;
+    if (vkCreateImageView(c->device, &vi, NULL, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
+    TV[TV_n].img = img, TV[TV_n].fmt = fmt, TV[TV_n].view = v, TV_n++;
+    return v;
+}
+
+static void temp_views_drop(VkCtx *c) {
+    for (int i = 0; i < TV_n; i++) vkDestroyImageView(c->device, TV[i].view, NULL);
+    TV_n = 0, TV_cap = 0;
+    free(TV), TV = NULL;
+}
+
+// ---- the ray shadows' temporal half (rt_shadow_temporal.comp), at the DLAA point where the camera matrices are ------
+static void rows_to_col(const float *rows, int nrows, float *m) {
+    memset(m, 0, 16 * sizeof *m);
+    for (int r = 0; r < nrows; r++)
+        for (int c = 0; c < 4; c++) m[c * 4 + r] = rows[r * 4 + c];
+    if (nrows == 3) m[15] = 1.0f;
+}
+
+static int inv4m(const float *m, float *o) {
+    double a[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) a[r][c] = m[c * 4 + r], a[r][4 + c] = r == c ? 1.0 : 0.0;
+    for (int c = 0; c < 4; c++) {
+        int pv = c;
+        for (int r = c + 1; r < 4; r++)
+            if (fabs(a[r][c]) > fabs(a[pv][c])) pv = r;
+        if (fabs(a[pv][c]) < 1e-12) return 0;
+        if (pv != c)
+            for (int k = 0; k < 8; k++) {
+                double t = a[c][k];
+                a[c][k] = a[pv][k], a[pv][k] = t;
+            }
+        double d = a[c][c];
+        for (int k = 0; k < 8; k++) a[c][k] /= d;
+        for (int r = 0; r < 4; r++) {
+            if (r == c) continue;
+            double f = a[r][c];
+            if (!f) continue;
+            for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
+        }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) o[c * 4 + r] = (float)a[r][4 + c];
+    return 1;
+}
+
+static void mul4m(const float *a, const float *b, float *o) {
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            double t = 0.0;
+            for (int k = 0; k < 4; k++) t += (double)a[k * 4 + r] * b[c * 4 + k];
+            o[c * 4 + r] = (float)t;
+        }
+}
+
+static int hist_make(VkCtx *c, uint32_t w, uint32_t h) {
+    for (int i = 0; i < 2; i++) {
+        if (S.hist_v[i]) vkDestroyImageView(c->device, S.hist_v[i], NULL), S.hist_v[i] = VK_NULL_HANDLE;
+        if (S.hist[i]) vmaDestroyImage(c->vma, S.hist[i], S.hist_a[i]), S.hist[i] = VK_NULL_HANDLE;
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                .imageType = VK_IMAGE_TYPE_2D,
+                                .format = VK_FORMAT_R16G16_SFLOAT,
+                                .extent = {w, h, 1},
+                                .mipLevels = 1,
+                                .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                                .initialLayout = VK_IMAGE_LAYOUT_GENERAL};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(c->vma, &ci, &ai, &S.hist[i], &S.hist_a[i], NULL) != VK_SUCCESS) return 0;
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                    .image = S.hist[i],
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                    .format = VK_FORMAT_R16G16_SFLOAT,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(c->device, &vi, NULL, &S.hist_v[i]) != VK_SUCCESS) return 0;
+    }
+    S.hist_w = w, S.hist_h = h, S.hist_cur = 0, S.have_prev = 0, S.hist_frames = 0;
+    return 1;
+}
+
+void vk_rt_shadow_apply(void *cb_, uint64_t scene, uint32_t w, uint32_t h, const float *cam) {
+    if (!vk_rt_shadows_on() || !S.ok || S.debug || !cb_ || !scene || !cam || !w || !h) return;
+    if (!S.mask || S.mask_w != w || S.mask_h != h) return;   // no mask this frame
+    VkCtx *c = vk_ctx();
+    VkCommandBuffer cb = (VkCommandBuffer)cb_;
+    if (S.hist_w != w || S.hist_h != h || !S.hist[0])
+        if (!hist_make(c, w, h)) return;
+    VkImageView sv = temp_view(c, (VkImage)scene, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    if (!sv) return;
+    float view[16], vp[16], invv[16], m[16];
+    rows_to_col(cam, 3, view);
+    rows_to_col(cam + 12, 4, vp);
+    if (!inv4m(view, invv)) return;
+    if (!S.have_prev) {
+        memcpy(S.prev_vp, vp, sizeof vp);
+        S.have_prev = 1;
+    }
+    mul4m(S.prev_vp, invv, m);
+    VkDescriptorImageInfo mi = {S.samp, S.mask_v, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo hi = {S.samp, S.hist_v[S.hist_cur], VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo ho = {VK_NULL_HANDLE, S.hist_v[S.hist_cur ^ 1], VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo si = {VK_NULL_HANDLE, sv, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet ws[4] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &mi},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &hi},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ho},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 3, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &si}};
+    float px = cam[7 * 4 + 0] > 0 ? cam[7 * 4 + 0] : 1.0f;
+    float py = cam[8 * 4 + 1] > 0 ? cam[8 * 4 + 1] : 1.0f;
+    static float hist_blend = -1.0f;   // TOTK_RT_SHADOW_HIST (0..0.99): the history's share, 0.85 by default
+    if (hist_blend < 0) {
+        const char *hv = cfg_get("TOTK_RT_SHADOW_HIST");
+        hist_blend = hv && *hv ? (float)atof(hv) : 0.85f;
+        if (hist_blend < 0) hist_blend = 0;
+        if (hist_blend > 0.99f) hist_blend = 0.99f;
+    }
+    float blend = S.hist_frames ? hist_blend : 0.0f;
+    float p4[24] = {px, py, (float)S.strength / 100.0f, blend, (float)w, (float)h, 1.0f / (float)w, 1.0f / (float)h,
+                    m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                    m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]};
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.soft_pipe);
+    S.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.soft_lay, 0, 4, ws);
+    vkCmdPushConstants(cb, S.soft_lay, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p4, p4);
+    vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
+    vkCmdPipelineBarrier2(cb, &di);
+    memcpy(S.prev_vp, vp, sizeof vp);
+    S.hist_cur ^= 1;
+    S.hist_frames++;
+}
+
 void vk_rt_shutdown(void) {
     VkCtx *c = vk_ctx();
     if (!c || !rt_up) return;
@@ -937,5 +1093,6 @@ void vk_rt_shutdown(void) {
     rt_nbl = 0, rt_tables = 0, rt_bvh_ready = 0, rt_set_i = 0;
     free(rt_inst);
     rt_inst = NULL, rt_ninst = rt_cinst = 0;
+    temp_views_drop(c);
     plat_rmutex_unlock(&rt_lock);
 }

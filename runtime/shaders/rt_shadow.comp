@@ -13,7 +13,7 @@ layout(binding = 0) uniform accelerationStructureEXT tlas;       // the scene BV
 layout(binding = 1) uniform sampler2D lin_depth;                // the game's linear depth: view distance / far
 layout(binding = 2, r11f_g11f_b10f) uniform image2D scene;      // the lit scene colour, darkened in place
 layout(binding = 3) uniform sampler2D sun_vis;                  // half-resolution lighting: alpha is sun visibility
-layout(binding = 4, r16f) uniform image2D mask_out;             // the occupancy, for the softening pass (rt_shadow_soft.comp)
+layout(binding = 4, rg16f) uniform image2D mask_out;            // r: the occupancy, g: the view distance (rt_shadow_temporal.comp)
 
 layout(push_constant) uniform Params {
     vec4 proj;    // projection x scale, y scale, far plane, strength (0..1)
@@ -118,5 +118,5 @@ void main() {
         imageStore(scene, px, vec4(occ, occ, occ, 1.0));
         return;
     }
-    imageStore(mask_out, px, vec4(occ * fade * lit * vis, 0.0, 0.0, 1.0));
+    imageStore(mask_out, px, vec4(occ * fade * lit * vis, z, 0.0, 1.0));
 }
