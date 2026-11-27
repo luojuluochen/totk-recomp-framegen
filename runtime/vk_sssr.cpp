@@ -586,7 +586,7 @@ extern "C" int vk_sssr_exec(void *cb_, uint64_t scene, uint64_t depth, uint64_t 
     dd.isRoughnessPerceptual = false;
     dd.temporalStabilityFactor = 0.9f;   // more history: the grain of one-ray-per-pixel tracing averages out
     dd.depthBufferThickness = 0.015f;
-    dd.roughnessThreshold = 0.18f;
+    dd.roughnessThreshold = 0.26f;   // more of the scene counts as reflective
     dd.varianceThreshold = 0.0f;
     dd.maxTraversalIntersections = 64;   // (4K full screen: 128 was far too slow here)
     dd.minTraversalOccupancy = 4;

@@ -37,13 +37,13 @@ void main() {
     // Schlick's 4 % at normal incidence is physically right and reads as nothing on a flat floor seen from above, so a
     // base weight carries the reflections the games show (TOTK_SSSR is the dial). The grazing end stops short of 1: a
     // reflection as bright as the surface itself is what turned the picture green.
-    float fres = 0.16 + 0.56 * pow(1.0 - nov, 3.0);
-    float k = min(pc.proj.w * fres, 1.0);   // the dial can ask for more, but a wall must not turn into a mirror
+    float fres = 0.26 + 0.60 * pow(1.0 - nov, 3.0);
+    float k = min(pc.proj.w * fres, 1.25);   // over one: a reflection can carry more than the surface colour   // the dial can ask for more, but a wall must not turn into a mirror
     vec4 c = imageLoad(scene, px);
     // What reflects cannot be much brighter than what is around it: a dark wall next to green grass otherwise blooms
     // green. The clamp is on luminance, the hue of the reflection stays.
     float lum = dot(rad, vec3(0.2126, 0.7152, 0.0722));
-    float cap = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)) * 2.0 + 0.02;
+    float cap = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)) * 3.0 + 0.03;
     if (lum > cap) rad *= cap / max(lum, 1e-5);
     imageStore(scene, px, vec4(c.rgb + rad * k, c.a));
 }
