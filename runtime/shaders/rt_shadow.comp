@@ -13,6 +13,7 @@ layout(binding = 0) uniform accelerationStructureEXT tlas;       // the scene BV
 layout(binding = 1) uniform sampler2D lin_depth;                // the game's linear depth: view distance / far
 layout(binding = 2, r11f_g11f_b10f) uniform image2D scene;      // the lit scene colour, darkened in place
 layout(binding = 3) uniform sampler2D sun_vis;                  // half-resolution lighting: alpha is sun visibility
+layout(binding = 4, r16f) uniform image2D mask_out;             // the occupancy, for the softening pass (rt_shadow_soft.comp)
 
 layout(push_constant) uniform Params {
     vec4 proj;    // projection x scale, y scale, far plane, strength (0..1)
@@ -48,6 +49,7 @@ vec3 normal_at(ivec2 px, vec3 p) {
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= int(pc.size.x) || px.y >= int(pc.size.y)) return;
+    imageStore(mask_out, px, vec4(0.0));   // every early return below leaves a lit pixel, not yesterday's mask
     float d = texelFetch(lin_depth, px, 0).x;
     if (d <= 0.0 || d >= 0.999) return;   // nothing drawn, or the sky
     float z = d * pc.proj.z;
@@ -83,27 +85,38 @@ void main() {
     float tol = 0.1 + 0.02 * z;
     if (abs(dot(q1 - p, n)) > tol || abs(dot(q2 - p, n)) > tol) return;
     float lit = smoothstep(0.0, 0.3, dot(n, pc.light.xyz));
+    // Four rays in a small cone around the sun with a fixed per-pixel rotation: the penumbra the game's own shadow
+    // maps have. One binary ray a pixel gave the second, jagged shadow layer and its shimmer.
     float occ = 0.0;
     if (lit > 0.0 && (vis > 0.0 || pc.opt.x >= 0.5)) {
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
-                              p + n * 0.05, 0.02, pc.light.xyz, 250.0);
-        rayQueryProceedEXT(rq);
-        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-            // A hit right against the surface is the game's own shading's business: leaf cards and blades shadow
-            // themselves with it, and painted black they read as sheets. This pass is for what the shadow maps miss
-            // further out.
-            float t = rayQueryGetIntersectionTEXT(rq, true);
-            occ = t > 1.0 ? 1.0 : 0.0;
+        vec3 L = normalize(pc.light.xyz);
+        vec3 up = abs(L.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3 tx = normalize(cross(up, L)), ty = cross(L, tx);
+        float h = fract(sin(dot(vec2(px), vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+        float hits = 0.0;
+        int rays = int(clamp(pc.opt.w, 1.0, 4.0));
+        for (int i = 0; i < 4; i++) {
+            if (i >= rays) break;
+            float a = h + 6.2831853 * float(i) / float(rays);
+            vec3 dir = normalize(L + (tx * cos(a) + ty * sin(a)) * pc.opt.z);
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+                                  p + n * 0.05, 0.02, dir, 250.0);
+            rayQueryProceedEXT(rq);
+            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                // A hit right against the surface is the game's own shading's business: leaf cards and blades shadow
+                // themselves with it, and painted black they read as sheets. This pass is for what the shadow maps miss
+                // further out.
+                float t = rayQueryGetIntersectionTEXT(rq, true);
+                hits += t > 1.0 ? 1.0 : 0.0;
+            }
         }
+        occ = hits / float(rays);
     }
     float fade = 1.0 - smoothstep(80.0, 120.0, z);
-    float k = 1.0 - pc.proj.w * occ * fade * lit * vis;
     if (pc.opt.x > 0.5) {   // debug: white where a ray hit, black where it left the scene, untouched elsewhere
         imageStore(scene, px, vec4(occ, occ, occ, 1.0));
         return;
     }
-    if (k >= 0.999) return;
-    vec4 c = imageLoad(scene, px);
-    imageStore(scene, px, vec4(c.rgb * k, c.a));
+    imageStore(mask_out, px, vec4(occ * fade * lit * vis, 0.0, 0.0, 1.0));
 }

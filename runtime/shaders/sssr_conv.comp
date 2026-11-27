@@ -1,0 +1,21 @@
+#version 450
+// FidelityFX SSSR reads a world-space normal (its shaders multiply it by the view matrix), while sssr_prep.comp makes a
+// view-space one at the scene's composite. This turns it over at the point SSSR runs, with the scene camera's inverse
+// view matrix.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D normal_in;               // the view-space normal, encoded [0, 1]
+layout(binding = 1, rgba16f) uniform image2D normal_out;       // the world-space one, encoded [0, 1]
+
+layout(push_constant) uniform Params {
+    vec4 size;    // width, height, 1/width, 1/height
+    vec4 ic0, ic1, ic2;   // the inverse view matrix's columns
+} pc;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.size.x) || px.y >= int(pc.size.y)) return;
+    vec3 n = texture(normal_in, (vec2(px) + 0.5) * pc.size.zw).xyz * 2.0 - 1.0;
+    vec3 nw = mat3(pc.ic0.xyz, pc.ic1.xyz, pc.ic2.xyz) * n;
+    imageStore(normal_out, px, vec4(nw * 0.5 + 0.5, 1.0));
+}

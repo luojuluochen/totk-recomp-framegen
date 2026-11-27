@@ -382,7 +382,8 @@ static int create_device(void) {
     // Ray tracing (vk_rt.c): opt in with TOTK_RT=1, probe or check. The extensions and their features are enabled
     // only when it is set, so a start without TOTK_RT is exactly as before. The feature query below fills the two
     // structs with what the GPU supports; the same chain then enables it.
-    int rt_want = cfg_bool("TOTK_RT");
+    const char *rt_mode = cfg_get("TOTK_RT");   // (no settings row: the environment or totk.ini only)
+    int rt_want = rt_mode && *rt_mode && strcmp(rt_mode, "0") != 0;
     if (rt_want) {
         if (has_ext(ep, ne, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
             has_ext(ep, ne, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&

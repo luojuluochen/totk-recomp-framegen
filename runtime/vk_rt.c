@@ -14,6 +14,7 @@
 #include "host.h"
 #include "nvn_api.h"   // gfx_counters.frames, the census window
 #include "platform/platform.h"
+#include "rt_shadow_soft_spv.h"
 #include "rt_shadow_spv.h"
 #include "vk.h"
 #include "vk_exec.h"   // VkExec: the replay's command buffer and fence
@@ -194,10 +195,12 @@ out:
 
 void vk_rt_init(void) {
     VkCtx *c = vk_ctx();
-    if (!c || !cfg_bool("TOTK_RT")) return;   // off: the log and the device are exactly as without RT
+    // TOTK_RT is not a settings-table row (the environment or totk.ini only): cfg_get, not cfg_value, so a run
+    // without it does not stop in the settings lookup.
     const char *mode = cfg_get("TOTK_RT");
+    if (!c || !mode || !*mode || !strcmp(mode, "0")) return;   // off: the log and the device are exactly as without RT
     if (!c->has_accel_struct || !c->has_ray_query) {
-        rt_log("rt: TOTK_RT=%s, but this GPU/driver has no acceleration structures + ray query; off", mode ? mode : "");
+        rt_log("rt: TOTK_RT=%s, but this GPU/driver has no acceleration structures + ray query; off", mode);
         return;
     }
     if (!load_fns(c->device)) {
@@ -205,7 +208,7 @@ void vk_rt_init(void) {
         return;
     }
     rt_up = 1;
-    rt_log("rt: on (TOTK_RT=%s): VK_KHR_acceleration_structure + VK_KHR_ray_query loaded", mode ? mode : "1");
+    rt_log("rt: on (TOTK_RT=%s): VK_KHR_acceleration_structure + VK_KHR_ray_query loaded", mode);
     if (!strcmp(mode, "probe")) probe();
 }
 
@@ -594,6 +597,14 @@ static struct {
     VkPipeline pipe;
     VkSampler samp;
     PFN_vkCmdPushDescriptorSetKHR push;
+    // the occupancy mask rt_shadow.comp writes and rt_shadow_soft.comp softens (and the softening pass' own pipeline)
+    VkImage mask;
+    VmaAllocation mask_a;
+    VkImageView mask_v;
+    uint32_t mask_w, mask_h;
+    VkDescriptorSetLayout soft_dsl;
+    VkPipelineLayout soft_lay;
+    VkPipeline soft_pipe;
 } S;
 
 static int rt_shadow_init(void) {
@@ -612,14 +623,15 @@ static int rt_shadow_init(void) {
     const char *dv = cfg_get("TOTK_RT_SHADOW_DEBUG");
     S.debug = dv && *dv && strcmp(dv, "0") ? atoi(dv) : 0;
     S.push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
-    VkDescriptorSetLayoutBinding b[4] = {
+    VkDescriptorSetLayoutBinding b[5] = {
         {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
     VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-                                           .bindingCount = 4, .pBindings = b};
+                                           .bindingCount = 5, .pBindings = b};
     VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
     VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                      .pSetLayouts = &S.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
@@ -647,7 +659,36 @@ static int rt_shadow_init(void) {
         rt_log("rt: shadows off: the compute pipeline failed (%d)", (int)r);
         return 0;
     }
-    rt_log("rt: shadows on: one ray toward the sun a pixel, strength %d%%%s", S.strength,
+    // the softening pass (rt_shadow_soft.comp): the occupancy mask blurred depth-aware, then onto the colour
+    VkDescriptorSetLayoutBinding sb[3] = {
+        {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+    VkDescriptorSetLayoutCreateInfo sdci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                           .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                                           .bindingCount = 3, .pBindings = sb};
+    VkPipelineLayoutCreateInfo sli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                      .pSetLayouts = &S.soft_dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+    VkShaderModuleCreateInfo smi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                    .codeSize = sizeof rt_shadow_soft_spv, .pCode = rt_shadow_soft_spv};
+    VkShaderModule sm = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(c->device, &sdci, NULL, &S.soft_dsl) != VK_SUCCESS ||
+        vkCreatePipelineLayout(c->device, &sli, NULL, &S.soft_lay) != VK_SUCCESS ||
+        vkCreateShaderModule(c->device, &smi, NULL, &sm) != VK_SUCCESS) {
+        rt_log("rt: shadows off: the softening pass could not be created");
+        return 0;
+    }
+    VkComputePipelineCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main"},
+                                       .layout = S.soft_lay};
+    VkResult sr = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &sci, NULL, &S.soft_pipe);
+    vkDestroyShaderModule(c->device, sm, NULL);
+    if (sr != VK_SUCCESS) {
+        rt_log("rt: shadows off: the softening pipeline failed (%d)", (int)sr);
+        return 0;
+    }
+    rt_log("rt: shadows on: four rays a pixel in a %.1f mrad cone, strength %d%%%s", 6.0, S.strength,
            S.debug ? " (debug view: the shadow factor in grey)" : "");
     S.ok = 1;
     return 1;
@@ -662,6 +703,31 @@ static void rt_shadow_record(struct VkExec *ex, const struct VkExecJob *j, VkAcc
     VkImageView sun = j->sun.img ? vk_exec_target_view(j->sun.img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_VIEW_TYPE_2D,
                                                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0)
                                  : VK_NULL_HANDLE;
+    // the occupancy mask rt_shadow.comp writes (R16F, the scene's size)
+    if (!S.mask || S.mask_w != j->scene.width || S.mask_h != j->scene.height) {
+        VkCtx *mc = vk_ctx();
+        if (S.mask_v) vkDestroyImageView(mc->device, S.mask_v, NULL), S.mask_v = VK_NULL_HANDLE;
+        if (S.mask) vmaDestroyImage(mc->vma, S.mask, S.mask_a), S.mask = VK_NULL_HANDLE;
+        VkImageCreateInfo mci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                 .imageType = VK_IMAGE_TYPE_2D,
+                                 .format = VK_FORMAT_R16_SFLOAT,
+                                 .extent = {j->scene.width, j->scene.height, 1},
+                                 .mipLevels = 1,
+                                 .arrayLayers = 1,
+                                 .samples = VK_SAMPLE_COUNT_1_BIT,
+                                 .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                 .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                                 .initialLayout = VK_IMAGE_LAYOUT_GENERAL};
+        VmaAllocationCreateInfo mai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(mc->vma, &mci, &mai, &S.mask, &S.mask_a, NULL) != VK_SUCCESS) return;
+        VkImageViewCreateInfo mvi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                     .image = S.mask,
+                                     .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                     .format = VK_FORMAT_R16_SFLOAT,
+                                     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(mc->device, &mvi, NULL, &S.mask_v) != VK_SUCCESS) return;
+        S.mask_w = j->scene.width, S.mask_h = j->scene.height;
+    }
     static int logged;
     if (!logged) {
         logged = 1;
@@ -678,6 +744,18 @@ static void rt_shadow_record(struct VkExec *ex, const struct VkExecJob *j, VkAcc
     pcv[12] = (float)S.debug;
     const char *iv = cfg_get("TOTK_RT_SHADOW_IGNORE_VIS");   // test: darken even where the game's shadow maps shadow
     pcv[13] = sun && !(iv && *iv && strcmp(iv, "0") != 0) ? 1.0f : 0.0f;
+    // the cone the rays take around the sun (radians) and how many rays a pixel: 4 softens the edge but costs 4x
+    // on the 65k-instance BVH, which is the frame's most expensive pass here
+    static float cone = 0.006f, rays = 2.0f;
+    static int opts_read;
+    if (!opts_read) {
+        opts_read = 1;
+        const char *cv = cfg_get("TOTK_RT_SHADOW_CONE");
+        if (cv && *cv) cone = (float)atof(cv);
+        const char *rv = cfg_get("TOTK_RT_SHADOW_RAYS");
+        if (rv && *rv) rays = (float)atoi(rv);
+    }
+    pcv[14] = cone, pcv[15] = rays;
     VkDescriptorImageInfo ii = {S.samp, in, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo oi = {VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo si = {S.samp, sun ? sun : in, VK_IMAGE_LAYOUT_GENERAL};
@@ -685,7 +763,8 @@ static void rt_shadow_record(struct VkExec *ex, const struct VkExecJob *j, VkAcc
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
         .accelerationStructureCount = 1,
         .pAccelerationStructures = &tlas};
-    VkWriteDescriptorSet w[4] = {
+    VkDescriptorImageInfo mi = {VK_NULL_HANDLE, S.mask_v, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[5] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, .pNext = &asw},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
@@ -693,9 +772,14 @@ static void rt_shadow_record(struct VkExec *ex, const struct VkExecJob *j, VkAcc
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &oi},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 3, .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &si}};
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &si},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 4, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &mi}};
+    if (S.debug) {   // the debug views write the colour themselves: no mask, no softening
+        pcv[3] = 1.0f;
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.pipe);
-    S.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.layout, 0, 4, w);
+    S.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.layout, 0, 5, w);
     vkCmdPushConstants(cb, S.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pcv, pcv);
     vkCmdDispatch(cb, (j->scene.width + 7) / 8, (j->scene.height + 7) / 8, 1);
     S.n++;
@@ -707,6 +791,27 @@ static void rt_shadow_record(struct VkExec *ex, const struct VkExecJob *j, VkAcc
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(cb, &di);
+    // the mask blurred depth-aware (rt_shadow_soft.comp) and onto the lit colour; the debug views wrote it already
+    if (!S.debug) {
+        VkDescriptorImageInfo mi2 = {S.samp, S.mask_v, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo di2 = {S.samp, in, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo oi2 = {VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet sw[3] = {
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &mi2},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &di2},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &oi2}};
+        float sp[8] = {0.0f, (float)S.strength / 100.0f, 0.0f, 0.0f,
+                       (float)j->scene.width, (float)j->scene.height, 1.0f / (float)j->scene.width,
+                       1.0f / (float)j->scene.height};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.soft_pipe);
+        S.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, S.soft_lay, 0, 3, sw);
+        vkCmdPushConstants(cb, S.soft_lay, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof sp, sp);
+        vkCmdDispatch(cb, (j->scene.width + 7) / 8, (j->scene.height + 7) / 8, 1);
+        vkCmdPipelineBarrier2(cb, &di);
+    }
     ex->recorded += 6;
     vk_exec_draw_new_cb(ex);
 }

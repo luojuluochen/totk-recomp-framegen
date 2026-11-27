@@ -27,6 +27,7 @@
 #include "vk_exec.h"
 #include "vk_fg.h"
 #include "vk_fsr3.h"
+#include "vk_sssr.h"
 #include "vk_rec.h"
 #include "dlaa_mv_spv.h"
 #include "fg_sky_spv.h"
@@ -1449,6 +1450,12 @@ static int fsr_evaluate(VkExec *ex, struct Size *e, const VkExecTarget *t, const
                     .dt_ms = dt > 0 && dt < 100 ? (float)dt : 16.67f, .reset = D.reset, .sharpness = sharp / 100.0f,
                     .fence = ex->fence};
     uint64_t c0 = timed ? kern_now_ns() : 0;
+    // FidelityFX SSSR (vk_sssr.cpp) over the colour the upscaler is about to read: it binds pipelines and descriptors
+    // of its own, so the next draw binds everything again.
+    if (rows && t->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && vk_sssr_on())
+        vk_sssr_exec(ex->cb, (uint64_t)(uintptr_t)t->image, (uint64_t)(uintptr_t)z->image, (uint64_t)(uintptr_t)e->mv,
+                     t->width, t->height, rows, ex->fence),
+            vk_exec_draw_new_cb(ex);
     int ok = fsr3_dispatch(ex->cb, &fr);
     if (timed) T.cpu_ngx += kern_now_ns() - c0;
     if (!ok) {
@@ -1716,6 +1723,16 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     double dt = D.last_eval_ns ? (now - D.last_eval_ns) / 1e6 : 0;
     D.last_eval_ns = now;
     p_setf(p, "FrameTimeDeltaInMsec", dt > 0 && dt < 100 ? (float)dt : 16.67f);
+    // FidelityFX SSSR (vk_sssr.cpp) over the colour DLSS is about to read: it binds pipelines and descriptors of its
+    // own, so the next draw binds everything again.
+    if (!t->level && !t->base_layer && !z->level && !z->base_layer && t->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+        vk_sssr_on()) {
+        const float *crows = D.cam_addr ? (const float *)vk_usnap_bytes(D.cam_addr, 11 * 16) : NULL;
+        if (crows &&
+            vk_sssr_exec(cb, (uint64_t)(uintptr_t)t->image, (uint64_t)(uintptr_t)z->image,
+                         (uint64_t)(uintptr_t)e->mv, w, h, crows, ex->fence))
+            vk_exec_draw_new_cb(ex);
+    }
     c0 = timed ? kern_now_ns() : 0;
     NgxResult r = N.evaluate(cb, e->feat, p, NULL);
     if (timed) T.cpu_ngx += kern_now_ns() - c0;

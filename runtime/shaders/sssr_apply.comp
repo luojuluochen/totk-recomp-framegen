@@ -1,0 +1,49 @@
+#version 450
+// FidelityFX SSSR's result onto the scene (runtime/vk_sssr.cpp): the reflection radiance the SDK leaves in its output,
+// weighted by Schlick's Fresnel (grazing surfaces reflect most, as water and polished stone do) and added to the lit
+// colour. The SDK's own composite multiplies by a split-sum BRDF factor; with no environment map traced here the
+// approximation below does the same job without a LUT.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D refl;                  // SSSR's output: reflection radiance
+layout(binding = 1) uniform sampler2D normal_tex;            // the encoded view-space normal (sssr_prep.comp)
+layout(binding = 2, r11f_g11f_b10f) uniform image2D scene;   // the lit scene colour, added to in place
+
+layout(push_constant) uniform Params {
+    vec4 proj;    // x, y projection scales, far plane, strength (0..1)
+    vec4 size;    // width, height, 1/width, 1/height
+    vec4 opt;     // x: debug (1: the reflection radiance)
+    vec4 vc0, vc1, vc2;   // the view matrix's columns: the world-space normal back to view space
+} pc;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.size.x) || px.y >= int(pc.size.y)) return;
+    vec3 rad = texture(refl, (vec2(px) + 0.5) * pc.size.zw).rgb;
+    if (pc.opt.x > 0.5) {   // debug: the reflection radiance as it came back
+        imageStore(scene, px, vec4(rad, 1.0));
+        return;
+    }
+    // A pixel the trace never wrote can hold NaN or an infinity in the float target: added to the scene it poisons the
+    // bloom and the tonemap, which then reads as a green picture. The debug view above shows those as black.
+    if (any(isnan(rad)) || any(isinf(rad))) return;
+    if (dot(rad, rad) <= 1e-8) return;
+    rad = min(rad, vec3(64.0));
+    vec3 nw = texture(normal_tex, (vec2(px) + 0.5) * pc.size.zw).xyz * 2.0 - 1.0;
+    vec3 n = normalize(mat3(pc.vc0.xyz, pc.vc1.xyz, pc.vc2.xyz) * nw);
+    vec2 ndc = (vec2(px) + 0.5) * pc.size.zw * 2.0 - 1.0;
+    vec3 v = normalize(vec3(ndc.x / pc.proj.x, -ndc.y / pc.proj.y, -1.0));
+    float nov = clamp(dot(n, -v), 0.0, 1.0);
+    // Schlick's 4 % at normal incidence is physically right and reads as nothing on a flat floor seen from above, so a
+    // base weight carries the reflections the games show (TOTK_SSSR is the dial). The grazing end stops short of 1: a
+    // reflection as bright as the surface itself is what turned the picture green.
+    float fres = 0.10 + 0.45 * pow(1.0 - nov, 3.0);
+    float k = min(pc.proj.w * fres, 0.6);   // the dial can ask for more, but a wall must not turn into a mirror
+    vec4 c = imageLoad(scene, px);
+    // What reflects cannot be much brighter than what is around it: a dark wall next to green grass otherwise blooms
+    // green. The clamp is on luminance, the hue of the reflection stays.
+    float lum = dot(rad, vec3(0.2126, 0.7152, 0.0722));
+    float cap = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)) * 2.0 + 0.02;
+    if (lum > cap) rad *= cap / max(lum, 1e-5);
+    imageStore(scene, px, vec4(c.rgb + rad * k, c.a));
+}

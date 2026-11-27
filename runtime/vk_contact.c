@@ -26,6 +26,7 @@
 // darkening the whole colour turned caves flat, where nearly every ray toward the sun meets the rock overhead. Without
 // that pass in the frame every pixel is darkened as before. TOTK_CONTACT_DEBUG=2 shows the visibility in grey.
 #include "vk.h"
+#include "vk_sssr.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -236,7 +237,7 @@ static int is_composite(const VkExec *ex) {
 int vk_contact_plan(const VkExec *ex, int pass, VkExecJob *j) {
     // The composite point is also where the scene's BVH is built (vk_rt.c vk_rt_shadow_exec): plan the job for it too
     // when ray tracing is on, even with the contact shadows themselves off.
-    if (!vk_contact_strength() && !ao_strength() && !vk_rt_shadows_on()) return 0;
+    if (!vk_contact_strength() && !ao_strength() && !vk_rt_shadows_on() && !vk_sssr_on()) return 0;
     if (pass) {
         const VkExecTarget *scene, *depth;
         // The camera block: c4 of the fragment stage, 0x940 bytes. The composite binds it only after its pass begins, so
