@@ -50,7 +50,7 @@ static const char *const known[] = {
     "GAMEPLAY_MAP_ZOOM", "GAMEPLAY_MAP_ZOOM_SENSITIVITY", "GAMEPLAY_ROTATION_SENSITIVITY", "GAMEPLAY_TWEAKS_ENABLED",
     "GAMEPLAY_ULTRAHAND_C_AXIS", "GAMEPLAY_ULTRAHAND_DISTANCE", "GAMEPLAY_ULTRAHAND_ROTATE", "GAMEPLAY_WEAPON_SENSITIVITY",
     "GAMEPLAY_WEAPON_WHEEL",
-    "GPL", "GPL_DRAW_BUILD", "GPU", "GPU_INDEX", "GPU_NAME", "GRASS_RANGE",
+    "GPL", "GPL_DRAW_BUILD", "GPU", "GPU_INDEX", "GPU_NAME", "GRASS_RANGE", "GTAO",
     "GYRO_AUTO_BIAS", "GYRO_BIAS_PAD", "GYRO_BIAS_X", "GYRO_BIAS_Y", "GYRO_BIAS_Z", "GYRO_CALIBRATION", "HDR", "HDR_GAME_NITS", "HDR_HUE",
     "HDR_PEAK_NITS", "HDR_UI_NITS", "HIGHFPS_FIX", "HUD_WIDTH", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "KSPIN_US", "LANG", "LIB_PREBUILD",
     "LIB_PREBUILD_KEEP", "LIB_PREBUILD_THREADS", "LOCALE", "LOD_GUARD", "LOD_STEADY", "LSTICK_DEADZONE", "MAP_CLICK", "MEMORY", "MEMX", "MENU_LANG", "MENU_TEST", "MENU_FONT_FONTCONFIG",
@@ -88,7 +88,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"SCENE_UPSCALER", "display"}, {"DLAA", "display"}, {"DLSS", "display"}, {"FSR_SHARPNESS", "display"}, {"DLSS_PRESET", "display"}, {"DLSS_CHAR_MASK", "display"}, {"DLSS_FG", "display"}, {"DLSS_FG_X", "display"}, {"DLSS_FIXED_EXPOSURE", "display"}, {"DLAA_EFFECTS_AFTER", "display"}, {"REFLEX", "display"}, {"FXAA", "display"},
     {"DEVICE_PROFILE", "display"}, {"ASSUME_FOCUS", "display"},
     {"DISCORD_RPC", "discord"}, {"DISCORD_APP_ID", "discord"}, {"DISCORD_IMAGE", "discord"},
-    {"SHADOW_SCALE", "display"}, {"SHADOW_RANGE", "display"}, {"GRASS_RANGE", "display"}, {"CONTACT_SHADOWS", "display"},
+    {"SHADOW_SCALE", "display"}, {"SHADOW_RANGE", "display"}, {"GRASS_RANGE", "display"}, {"CONTACT_SHADOWS", "display"}, {"GTAO", "display"},
     {"PCSS", "display"},
     {"MODS_DIR", "mods"}, {"MODS_ORDER", "mods"}, {"MODS_DISABLED", "mods"}, {"MODS_NO_CODE", "mods"}, {"MODS_REBUILD", "mods"}, {"MODS_WITHOUT_CODE", "mods"},
     {"TEX_HEAP_EXTRA_MB", "mods"},
@@ -162,6 +162,7 @@ static const CfgMeta metas[] = {
     {"SHADOW_SCALE", "1", "1..4", RESTART},
     {"SHADOW_RANGE", "100", "50..400", RESTART}, {"GRASS_RANGE", "100", "50..400", RESTART}, {"CONTACT_SHADOWS", "0", "0..100", RESTART},
     {"PCSS", "0", "0..200", RESTART},
+    {"GTAO", "0", "0..100", RESTART},
     // Game
     {"FPS_LIMIT", "60", "30|40|45|60|90|120|144|display", LIVE}, {"FPS60", "1", "0|1", LIVE}, {"FRAME_QUEUE", "0", "0|1", LIVE},
     {"FRAME_GEN", "off", "off|fsr3", LIVE},   // the generator; vk_fg.cpp vk_fg_engine maps it
