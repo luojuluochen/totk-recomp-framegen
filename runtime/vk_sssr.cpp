@@ -414,8 +414,11 @@ static void wait_ring(uint64_t fence) {
 
 extern "C" int vk_sssr_on(void) {
     static int v = -1;
-    if (v < 0) {
-        const char *sv = cfg_get("TOTK_SSSR");   // (no settings row: the environment or totk.ini, as TOTK_RT)
+    static unsigned seen;
+    unsigned ver = cfg_version();
+    if (v < 0 || ver != seen) {   // the menu's row sets it while the game runs
+        seen = ver;
+        const char *sv = cfg_get("TOTK_SSSR");
         int s = sv && *sv ? atoi(sv) : 0;
         v = s < 0 ? 0 : s > 200 ? 200 : s;
     }
