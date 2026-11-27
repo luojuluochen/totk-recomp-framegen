@@ -10,6 +10,7 @@ layout(push_constant) uniform P {
     ivec2 size;     // its size, the size of dst
     vec4 adj;       // brightness (added), contrast, saturation, gamma (exponent)
     vec4 tint;      // x: green/magenta, -1 (magenta) .. 1 (green), 0 leaves it
+    vec4 fog;       // x: 0..1, how much of the milky veil (a black point) to take out
 } pc;
 
 void main() {
@@ -18,6 +19,10 @@ void main() {
     vec3 c = texelFetch(src, p + pc.offset, 0).rgb;
     c += pc.adj.x;
     c = (c - 0.5) * pc.adj.y + 0.5;
+    // The fog's veil sits on the whole picture as a lifted black: subtracting it and stretching back is what makes
+    // a hazy scene read clear. The game's own fog is untouched; this is the veil it leaves.
+    float fg = clamp(pc.fog.x, 0.0, 1.0) * 0.20;
+    if (fg > 0.001) c = max(c - fg, vec3(0.0)) / (1.0 - fg);
     c = mix(vec3(dot(c, vec3(0.2126, 0.7152, 0.0722))), c, pc.adj.z);
     // The green/magenta axis, the one a scene's haze tips without the other two: at +1 the green goes up 15 % and red
     // and blue down 7.5 % (a greener picture), at -1 the other way.

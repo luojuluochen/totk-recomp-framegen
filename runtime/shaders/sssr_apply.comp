@@ -38,7 +38,7 @@ void main() {
     // base weight carries the reflections the games show (TOTK_SSSR is the dial). The grazing end stops short of 1: a
     // reflection as bright as the surface itself is what turned the picture green.
     float fres = 0.16 + 0.56 * pow(1.0 - nov, 3.0);
-    float k = min(pc.proj.w * fres, 0.85);   // the dial can ask for more, but a wall must not turn into a mirror
+    float k = min(pc.proj.w * fres, 1.0);   // the dial can ask for more, but a wall must not turn into a mirror
     vec4 c = imageLoad(scene, px);
     // What reflects cannot be much brighter than what is around it: a dark wall next to green grass otherwise blooms
     // green. The clamp is on luminance, the hue of the reflection stays.

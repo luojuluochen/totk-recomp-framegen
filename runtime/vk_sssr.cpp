@@ -437,6 +437,13 @@ extern "C" int vk_sssr_prepare(void *cb_, uint64_t lin_depth, uint64_t lit, uint
     if (S.failed || !vk_sssr_on() || !cb_ || !lin_depth || !w || !h) return 0;
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = (VkCommandBuffer)cb_;
+    // The context follows the scene's render size (DLSS modes and resolution change it), but not the inventory's icon
+    // targets: rebuilding for those (and back) every frame took the device down.
+    if (S.ok && (w != S.w || h != S.h)) {
+        if (w < 1280 || h < 720) return 0;
+        vkDeviceWaitIdle(c->device);
+        destroy_all(c);
+    }
     if (!ensure(c, w, h, cb)) return 0;
     VkImageView dv = view_of(c, (VkImage)lin_depth, VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT);
     if (!dv) return 0;

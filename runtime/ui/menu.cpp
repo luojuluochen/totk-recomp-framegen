@@ -784,6 +784,7 @@ static void rows_color(void) {
                         "%.0f %%");
     moved |= opt_slider("TOTK_COLOR_GAMMA", UI_MENU_COLOR_GAMMA, 0.8f, 1.2f, UI_MENU_COLOR_GAMMA_DESC, 0.02f, "%.2f");
     moved |= opt_slider("TOTK_COLOR_TINT", UI_MENU_COLOR_TINT, -100, 100, UI_MENU_COLOR_TINT_DESC, 5, "%+.0f %%");
+    moved |= opt_slider("TOTK_COLOR_FOG", UI_MENU_COLOR_FOG, 0, 100, UI_MENU_COLOR_FOG_DESC, 5, "%.0f %%");
     if (moved && strcmp(cfg_value("TOTK_COLOR_PRESET"), "custom")) {
         cfg_set("TOTK_COLOR_PRESET", "custom");
         cfg_save();
